@@ -1,0 +1,102 @@
+name: build
+
+# Every push / PR builds. Pushes to main also publish a release tagged
+# v<VERSION> -- bump the VERSION file to cut a new one. If the tag already
+# exists the release step is skipped (tags are never moved or overwritten).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      # Submodules are not checked out here: edk2 is huge and we only need
+      # MdePkg's headers, fetched below at the commit the submodule pins.
+      - uses: actions/checkout@v4
+
+      - name: Read VERSION
+        id: version
+        run: |
+          v=$(tr -d '[:space:]' < VERSION)
+          if [[ ! "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error file=VERSION::'$v' is not a semantic version (e.g. 1.2.3 or 1.2.3-rc.1)"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch edk2 headers (pinned commit, MdePkg/Include only)
+        run: |
+          sha=$(git ls-tree HEAD edk2 | awk '{print $3}')
+          echo "edk2 @ $sha"
+          git -C edk2 init -q
+          git -C edk2 remote add origin https://github.com/tianocore/edk2.git
+          git -C edk2 sparse-checkout set MdePkg/Include
+          git -C edk2 fetch -q --depth 1 --filter=blob:none origin "$sha"
+          git -C edk2 checkout -q FETCH_HEAD
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld
+          # Some lld packages only ship the versioned name (lld-link-18 ...).
+          command -v lld-link >/dev/null ||
+            sudo ln -s "$(ls /usr/bin/lld-link-* | sort -V | tail -1)" /usr/local/bin/lld-link
+          clang --version | head -1
+          lld-link --version
+
+      - name: Build
+        run: make all tests
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp build/partybox.efi dist/
+          (cd dist && sha256sum partybox.efi > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: partybox-${{ steps.version.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: partybox-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: Publish v${{ needs.build.outputs.version }}
+        run: |
+          tag="v$VERSION"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+             gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
+            echo "::notice::$tag already exists, skipping release. Bump VERSION to publish a new one."
+            exit 0
+          fi
+          flags=()
+          [[ "$VERSION" == *-* ]] && flags+=(--prerelease)
+          gh release create "$tag" dist/partybox.efi dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "partybox $tag" --generate-notes "${flags[@]}"
