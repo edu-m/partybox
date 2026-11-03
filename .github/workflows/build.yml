@@ -21,7 +21,7 @@ jobs:
     steps:
       # Submodules are not checked out here: edk2 is huge and we only need
       # MdePkg's headers, fetched below at the commit the submodule pins.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Read VERSION
         id: version
@@ -63,7 +63,7 @@ jobs:
           (cd dist && sha256sum partybox.efi > SHA256SUMS)
           cat dist/SHA256SUMS
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: partybox-${{ steps.version.outputs.version }}
           path: dist/
@@ -82,7 +82,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       VERSION: ${{ needs.build.outputs.version }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: partybox-${{ needs.build.outputs.version }}
           path: dist
