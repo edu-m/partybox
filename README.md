@@ -2,8 +2,9 @@
 
 A tiny graphical EFI launcher meant to be chainloaded from another bootloader
 (Limine, systemd-boot, the firmware boot menu, the UEFI shell…). On every start
-it scans the `PARTYBOX` folder **next to its own .efi** and lists every `.efi`
-it finds, so you can drop test programs into a folder and pick one after a
+it scans the `PARTYBOX` folder **next to its own .efi** and lists every EFI
+application it finds (by content, not by name, so EFI-stub kernels like
+`vmlinuz-linux` count too), so you can drop test programs into a folder and pick one after a
 reboot without ever touching your main bootloader's config.
 
 ```
@@ -23,8 +24,12 @@ ESP
 
 - GOP graphics with antialiased text and a HiDPI layout (2× sizes from 2000×1400 up).
   Falls back to a plain text menu on serial-only / no-GOP systems.
-- Lists `*.efi` (case-insensitive), sorted, with file sizes. Ignores dot-files
-  such as macOS `._foo.efi` junk.
+- Recognises EFI applications from their PE headers: an image counts if it's
+  an EFI application (Subsystem 10) built for this CPU (or EBC), whatever it's
+  called. Files named `*.efi` that don't qualify are still listed, greyed out
+  with the reason ("built for AArch64", "EFI driver, not an application", "not
+  an EFI image"). Any other file (initrds, configs…) is ignored, as are
+  dot-files such as macOS `._foo.efi` junk. Sorted, with file sizes.
 - Launched apps get a proper `DeviceHandle`/`FilePath`, so they can locate
   their own files (and a nested partybox works).
 - When an app returns, partybox comes back, restores its video mode if the app

@@ -137,62 +137,106 @@ static bool looks_like_pkcs7(const uint8_t *b, uint32_t have, uint32_t blob_len)
     return memcmp(b + hdr, signed_data_oid, sizeof(signed_data_oid)) == 0;
 }
 
+/* ---- PE recognition ---------------------------------------------------- */
+
+#define IMAGE_SUBSYSTEM_EFI_APPLICATION         10
+#define IMAGE_SUBSYSTEM_EFI_BOOT_SERVICE_DRIVER 11
+#define IMAGE_SUBSYSTEM_EFI_RUNTIME_DRIVER      12
+#define IMAGE_FILE_MACHINE_EBC                  0x0EBC
+
+#if defined(__x86_64__)
+#define NATIVE_MACHINE 0x8664
+#elif defined(__aarch64__)
+#define NATIVE_MACHINE 0xAA64
+#elif defined(__riscv) && __riscv_xlen == 64
+#define NATIVE_MACHINE 0x5064
+#elif defined(__loongarch64)
+#define NATIVE_MACHINE 0x6264
+#elif defined(__i386__)
+#define NATIVE_MACHINE 0x014C
+#else
+#error "unsupported architecture"
+#endif
+
+struct pe_info {
+    uint16_t machine, subsystem;
+    uint32_t sec_off, sec_size; /* security directory; 0/0 if the header has none */
+};
+
+/* Parse just enough of the DOS, COFF and optional headers to classify the
+ * image. Returns false if this isn't a PE image at all. Everything is read
+ * from the file with exact-length reads and bounds-checked against fsize. */
+static bool pe_parse(EFI_FILE_PROTOCOL *f, uint64_t fsize, struct pe_info *pi) {
+    memset(pi, 0, sizeof(*pi));
+
+    uint8_t dos[64];
+    if (fsize < sizeof(dos) || !read_at(f, 0, dos, sizeof(dos)) || dos[0] != 'M' || dos[1] != 'Z')
+        return false;
+    uint64_t pe = rd32(dos + 0x3c); /* 64-bit so pe + offsets can't wrap */
+
+    /* "PE\0\0" + IMAGE_FILE_HEADER */
+    uint8_t coff[24];
+    if (pe + sizeof(coff) > fsize || !read_at(f, pe, coff, sizeof(coff)) || memcmp(coff, "PE\0\0", 4) != 0)
+        return false;
+    pi->machine = rd16(coff + 4);
+    uint16_t opt_size = rd16(coff + 20);
+
+    /* Optional header, up to and including DataDirectory[4] (152 bytes for
+     * PE32+). Never read past SizeOfOptionalHeader. */
+    uint8_t opt[112 + 5 * 8];
+    uint32_t want = opt_size < sizeof(opt) ? opt_size : sizeof(opt);
+    if (want < 70 /* through Subsystem */ || pe + sizeof(coff) + want > fsize ||
+        !read_at(f, pe + sizeof(coff), opt, want))
+        return false;
+
+    uint32_t nrva_off; /* offset of NumberOfRvaAndSizes */
+    switch (rd16(opt)) {
+    case 0x20b: nrva_off = 108; break; /* PE32+ */
+    case 0x10b: nrva_off = 92; break;  /* PE32 */
+    default: return false;
+    }
+    pi->subsystem = rd16(opt + 68); /* same offset in PE32 and PE32+ */
+
+    /* The data directories follow NumberOfRvaAndSizes, 8 bytes each; the
+     * security directory is entry 4. It only exists if the header is long
+     * enough and declares more than 4 directories. */
+    uint32_t dir4 = nrva_off + 4 + 4 * 8;
+    if (want >= dir4 + 8 && rd32(opt + nrva_off) > 4) {
+        pi->sec_off = rd32(opt + dir4);
+        pi->sec_size = rd32(opt + dir4 + 4);
+    }
+    return true;
+}
+
+/* NULL if this firmware can start the image as an application, otherwise a
+ * short reason for the UI. */
+static const CHAR16 *pe_problem(bool is_pe, const struct pe_info *pi) {
+    if (!is_pe) return L"not an EFI image";
+    if (pi->subsystem == IMAGE_SUBSYSTEM_EFI_BOOT_SERVICE_DRIVER ||
+        pi->subsystem == IMAGE_SUBSYSTEM_EFI_RUNTIME_DRIVER)
+        return L"EFI driver, not an application";
+    if (pi->subsystem != IMAGE_SUBSYSTEM_EFI_APPLICATION) return L"not an EFI application";
+    if (pi->machine == NATIVE_MACHINE || pi->machine == IMAGE_FILE_MACHINE_EBC) return NULL;
+    switch (pi->machine) {
+    case 0x014C: return L"built for IA32";
+    case 0x8664: return L"built for x64";
+    case 0xAA64: return L"built for AArch64";
+    case 0x01C2: case 0x01C4: return L"built for ARM";
+    case 0x5064: return L"built for RISC-V";
+    case 0x6264: return L"built for LoongArch";
+    default: return L"built for another CPU";
+    }
+}
+
 /* Does this PE carry an Authenticode signature? Walks the attribute
  * certificate table like edk2's DxeImageVerificationLib does and looks for a
  * PKCS#7 signedData blob, either as WIN_CERT_TYPE_PKCS_SIGNED_DATA or wrapped
  * in WIN_CERT_TYPE_EFI_GUID with CertType == EFI_CERT_TYPE_PKCS7_GUID. This
  * says nothing about whether the firmware trusts the signer -- only
  * LoadImage can tell that. */
-static bool pe_signed(EFI_FILE_PROTOCOL *f, uint64_t fsize) {
-    uint8_t dos[64];
-    if (!read_at(f, 0, dos, sizeof(dos)) || dos[0] != 'M' || dos[1] != 'Z')
-        return false;
-
-    uint64_t pe = rd32(dos + 0x3c); /* 64-bit so pe + offsets can't wrap */
-
-    /* Read COFF header (4-byte signature + 20-byte File Header) */
-    uint8_t coff[24];
-    if (pe + sizeof(coff) > fsize || !read_at(f, pe, coff, sizeof(coff)))
-        return false;
-    if (memcmp(coff, "PE\0\0", 4) != 0) 
-        return false;
-
-    uint16_t opt_hdr_size = rd16(coff + 20);
-    if (opt_hdr_size < 2) 
-        return false;
-
-    /* Read Magic to determine PE32 vs PE32+ */
-    uint16_t magic;
-    uint8_t magic_buf[2];
-    if (!read_at(f, pe + 24, magic_buf, 2)) 
-        return false;
-    magic = rd16(magic_buf);
-
-    uint32_t nrva_offset;
-    if (magic == 0x20b) {        /* PE32+ (x86_64, AArch64, RISC-V 64) */
-        nrva_offset = 108;
-    } else if (magic == 0x10b) { /* PE32 (IA32, ARM32) */
-        nrva_offset = 92;
-    } else {
-        return false;
-    }
-
-    /* Verify the header is large enough to contain DataDirectory[4] */
-    if (opt_hdr_size < nrva_offset + 4 + (5 * 8)) 
-        return false;
-
-    /* NumberOfRvaAndSizes is followed by the data directories (8 bytes each);
-     * the security directory is entry 4, i.e. 4 + 4 * 8 bytes further on. */
-    uint8_t nrva_buf[4], sec_dir[8];
-    if (!read_at(f, pe + 24 + nrva_offset, nrva_buf, sizeof(nrva_buf)))
-        return false;
-    if (rd32(nrva_buf) <= 4) /* Must have at least 5 directories to include index 4 */
-        return false;
-    if (!read_at(f, pe + 24 + nrva_offset + 4 + 4 * 8, sec_dir, sizeof(sec_dir)))
-        return false;
-
-    uint32_t off  = rd32(sec_dir);
-    uint32_t size = rd32(sec_dir + 4);
+static bool pe_signed(EFI_FILE_PROTOCOL *f, uint64_t fsize, const struct pe_info *pi) {
+    uint32_t off  = pi->sec_off;
+    uint32_t size = pi->sec_size;
 
     /* Directory offset must be non-zero, 8-byte aligned, and within file bounds */
     if (!off || (off & 7) != 0 || size < WIN_CERT_HDR || (uint64_t)off + size > fsize)
@@ -235,7 +279,8 @@ static bool pe_signed(EFI_FILE_PROTOCOL *f, uint64_t fsize) {
     return false;
 }
 
-static void add_app(struct scan *s, const CHAR16 *group, const EFI_FILE_INFO *fi, bool is_signed) {
+static void add_app(struct scan *s, const CHAR16 *group, const EFI_FILE_INFO *fi, bool is_signed,
+                    const CHAR16 *problem) {
     if (s->count == s->cap) {
         int ncap = s->cap ? s->cap * 2 : 16;
         struct app *na = xalloc(sizeof(*na) * (size_t)ncap);
@@ -251,13 +296,24 @@ static void add_app(struct scan *s, const CHAR16 *group, const EFI_FILE_INFO *fi
     a->group = group ? wdup(group) : NULL;
     a->size = fi->FileSize;
     a->is_signed = is_signed;
-    if (!a->rel || !a->label) return;
-    a->label[wlen(a->label) - 4] = 0; /* drop ".efi" */
+    a->problem = problem;
+    if (!a->rel || !a->label) {
+        xfree(a->rel);
+        xfree(a->label);
+        xfree(a->group);
+        return;
+    }
+    size_t n = wlen(a->label);
+    if (n > 4 && wends_with_i(a->label, L".efi")) a->label[n - 4] = 0; /* "memtest.efi" -> "memtest" */
     s->count++;
 }
 
-/* Enumerate .efi files in `dir`. At the top level, also descend one level into
- * sub-directories so an app can ship with its own files. */
+/* Enumerate EFI applications in `dir`, recognised by their PE headers rather
+ * than their names, so e.g. an EFI-stub "vmlinuz-linux" shows up too. Files
+ * named *.efi that can't be started here are listed with the reason; other
+ * files that aren't EFI applications (initrds, configs, ...) are ignored. At
+ * the top level, also descend one level into sub-directories so an app can
+ * ship with its own files. */
 static void scan_dir(struct scan *s, EFI_FILE_PROTOCOL *dir, const CHAR16 *group) {
     UINTN cap = SIZE_OF_EFI_FILE_INFO + 256 * sizeof(CHAR16);
     EFI_FILE_INFO *fi = xalloc(cap);
@@ -287,14 +343,18 @@ static void scan_dir(struct scan *s, EFI_FILE_PROTOCOL *dir, const CHAR16 *group
                 xfree(gname);
                 sub->Close(sub);
             }
-        } else if (fi->FileSize > 0 && wlen(name) > 4 && wends_with_i(name, L".efi")) {
+        } else if (fi->FileSize > 0) {
             EFI_FILE_PROTOCOL *file = NULL;
-            bool is_signed = false;
-            if (!EFI_ERROR(dir->Open(dir, &file, (CHAR16 *)name, EFI_FILE_MODE_READ, 0))) {
-                is_signed = pe_signed(file, fi->FileSize);
-                file->Close(file);
+            if (EFI_ERROR(dir->Open(dir, &file, (CHAR16 *)name, EFI_FILE_MODE_READ, 0))) continue;
+            struct pe_info pi;
+            bool is_pe = pe_parse(file, fi->FileSize, &pi);
+            const CHAR16 *problem = pe_problem(is_pe, &pi);
+            bool named_efi = wlen(name) > 4 && wends_with_i(name, L".efi");
+            if (!problem || named_efi) {
+                bool is_signed = !problem && pe_signed(file, fi->FileSize, &pi);
+                add_app(s, group, fi, is_signed, problem);
             }
-            add_app(s, group, fi, is_signed);
+            file->Close(file);
         }
     }
     xfree(fi);

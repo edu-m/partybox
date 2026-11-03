@@ -84,7 +84,15 @@ static void build_rows(struct ui *u) {
     u->nrows = n;
 }
 
+/* Land on the first app that can actually start (that's what autoboot runs),
+ * else on the first selectable row. */
 static void select_first(struct ui *u) {
+    for (int i = 0; i < u->nrows; i++) {
+        if (u->rows[i].kind == ROW_APP && !u->scan.apps[u->rows[i].app].problem) {
+            u->sel = i;
+            return;
+        }
+    }
     for (u->sel = 0; u->sel < u->nrows && !selectable(&u->rows[u->sel]); u->sel++) {}
 }
 
@@ -231,7 +239,11 @@ static void draw_warn_chip(struct gfx *g, const struct font *f, int x, int y, in
 }
 
 static bool flag_unsigned(const struct ui *u, const struct app *a) {
-    return u->secure_boot && !a->is_signed;
+    return u->secure_boot && !a->problem && !a->is_signed;
+}
+
+static bool launchable_row(const struct ui *u, int i) {
+    return u->rows[i].kind == ROW_APP && !u->scan.apps[u->rows[i].app].problem;
 }
 
 static void draw_row(struct ui *u, const struct layout *L, const struct row *r, int y, bool sel, bool scrollbar) {
@@ -267,7 +279,12 @@ static void draw_row(struct ui *u, const struct layout *L, const struct row *r, 
         const struct app *a = &u->scan.apps[r->app];
         label = a->label;
         warn = flag_unsigned(u, a);
-        wformat_size(right_text, 64, a->size);
+        if (a->problem) {
+            wcopy(right_text, 64, a->problem); /* greyed out, with the reason */
+            fg = dim;
+        } else {
+            wformat_size(right_text, 64, a->size);
+        }
         if (a->group) {
             CHAR16 grp[80];
             wcopy(grp, 80, a->group);
@@ -330,8 +347,15 @@ static void render(struct ui *u) {
     if (u->scan.found) {
         wcopy(sub, 300, u->scan.dir);
         wappend(sub, 300, L"   \x00B7   ");
-        wappend_u64(sub, 300, (uint64_t)u->scan.count);
-        wappend(sub, 300, u->scan.count == 1 ? L" app" : L" apps");
+        int ok = 0;
+        for (int i = 0; i < u->scan.count; i++) ok += !u->scan.apps[i].problem;
+        wappend_u64(sub, 300, (uint64_t)ok);
+        wappend(sub, 300, ok == 1 ? L" app" : L" apps");
+        if (u->scan.count > ok) {
+            wappend(sub, 300, L"   \x00B7   ");
+            wappend_u64(sub, 300, (uint64_t)(u->scan.count - ok));
+            wappend(sub, 300, L" can't start");
+        }
         if (u->scan.fallback) wappend(sub, 300, L"   \x00B7   found by searching all volumes");
     } else {
         wcopy(sub, 300, L"Create ");
@@ -410,6 +434,11 @@ static void render_text(struct ui *u) {
         o->OutputString(o, sel ? L" > " : L"   ");
         if (r->kind == ROW_APP) o->OutputString(o, flag_unsigned(u, &u->scan.apps[r->app]) ? L"! " : L"  ");
         o->OutputString(o, r->kind == ROW_APP ? u->scan.apps[r->app].rel : (CHAR16 *)r->text);
+        if (r->kind == ROW_APP && u->scan.apps[r->app].problem) {
+            o->OutputString(o, L"  (");
+            o->OutputString(o, (CHAR16 *)u->scan.apps[r->app].problem);
+            o->OutputString(o, L")");
+        }
         o->OutputString(o, L" ");
         o->SetAttribute(o, EFI_TEXT_ATTR(EFI_LIGHTGRAY, EFI_BLACK));
         o->OutputString(o, L"\r\n");
@@ -661,6 +690,10 @@ static bool activate(struct ui *u) {
     switch (r->kind) {
     case ROW_APP: {
         const struct app *a = &u->scan.apps[r->app];
+        if (a->problem) {
+            set_msg(u, C_ERR, a->rel, L" can't be started here: ", a->problem);
+            return true;
+        }
         if (flag_unsigned(u, a) && !confirm_unsigned(u, a)) return true;
         launch(u, a);
         return true;
@@ -724,7 +757,7 @@ static int parse_timeout(void) {
 }
 
 static void start_countdown(struct ui *u, int seconds) {
-    if (seconds <= 0 || u->rows[u->sel].kind != ROW_APP) return;
+    if (seconds <= 0 || !launchable_row(u, u->sel)) return;
     if (EFI_ERROR(gBS->CreateEvent(EVT_TIMER, 0, NULL, NULL, &u->timer))) return;
     if (EFI_ERROR(gBS->SetTimer(u->timer, TimerPeriodic, 10000000 /* 1 s in 100 ns units */))) {
         gBS->CloseEvent(u->timer);

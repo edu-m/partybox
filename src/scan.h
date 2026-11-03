@@ -3,10 +3,11 @@
 
 struct app {
     CHAR16 *rel;      /* path relative to the PARTYBOX dir, e.g. L"tools\\memtest.efi" */
-    CHAR16 *label;    /* display name without extension, e.g. L"memtest" */
+    CHAR16 *label;    /* display name without a ".efi" extension, e.g. L"memtest" */
     CHAR16 *group;    /* sub-directory name or NULL */
     uint64_t size;
     bool is_signed;   /* PE carries an Authenticode signature (not checked against db) */
+    const CHAR16 *problem; /* NULL if launchable, else why not (static string) */
 };
 
 struct scan {
