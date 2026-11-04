@@ -1,0 +1,84 @@
+AudioDxe (FangJiaZhen/AudioPkg fork): make it work under QEMU/OVMF and cut
+its latency for games.
+ - set RINTCNT=1, enable the RIRB interrupt bit and acknowledge RIRBSTS after
+   each response: QEMU pauses the CORB once RINTCNT responses are pending until
+   the status is cleared, so with the defaults no codec command ever got an
+   answer under OVMF (real boards didn't care)
+ - 32 x 4 KB DMA blocks polled every 10 ms instead of 8 x 64 KB every 100 ms:
+   ~90 ms of latency instead of ~1 s
+
+diff --git a/Platform/AudioDxe/HdaController/HdaController.c b/Platform/AudioDxe/HdaController/HdaController.c
+index cf97eba..8c80bfe 100644
+--- a/Platform/AudioDxe/HdaController/HdaController.c
++++ b/Platform/AudioDxe/HdaController/HdaController.c
+@@ -493,6 +493,12 @@ START:
+             if (EFI_ERROR(Status))
+                 goto DONE;
+ 
++            // Acknowledge responses (clear RINTFL/RIRBOIS) so the controller keeps
++            // processing the CORB; QEMU pauses it once RINTCNT responses are pending.
++            if (HdaDev->RirbReadPointer != HdaRirbWritePointer) {
++                UINT8 HdaRirbSts = HDA_REG_RIRBSTS_RINTFL | HDA_REG_RIRBSTS_RIRBOIS;
++                PciIo->Mem.Write(PciIo, EfiPciIoWidthUint8, PCI_HDA_BAR, HDA_REG_RIRBSTS, 1, &HdaRirbSts);
++            }
+             // If the read and write pointers differ, there are responses waiting.
+             while (HdaDev->RirbReadPointer != HdaRirbWritePointer) {
+                 // Increment RIRB read pointer.
+diff --git a/Platform/AudioDxe/HdaController/HdaController.h b/Platform/AudioDxe/HdaController/HdaController.h
+index 1ba7df1..16e62b0 100644
+--- a/Platform/AudioDxe/HdaController/HdaController.h
++++ b/Platform/AudioDxe/HdaController/HdaController.h
+@@ -101,16 +101,16 @@ typedef struct {
+ 
+ // Buffer Descriptor List sizes. Max number of entries is 256, min is 2.
+ #define HDA_BDL_ENTRY_IOC       BIT0
+-#define HDA_BDL_ENTRY_COUNT     8
++#define HDA_BDL_ENTRY_COUNT     32   // was 8: small blocks for low-latency streaming
+ #define HDA_BDL_SIZE            (sizeof(HDA_BDL_ENTRY) * HDA_BDL_ENTRY_COUNT)
+ #define HDA_BDL_ENTRY_HALF      ((HDA_BDL_ENTRY_COUNT / 2) - 1)
+ #define HDA_BDL_ENTRY_LAST      (HDA_BDL_ENTRY_COUNT - 1)
+ 
+ // Buffer size and block size.
+-#define HDA_STREAM_BUF_SIZE         BASE_512KB
++#define HDA_STREAM_BUF_SIZE         BASE_128KB   // 32 x 4 KB blocks (23 ms each at 44.1 kHz stereo 16-bit)
+ #define HDA_STREAM_BUF_SIZE_HALF    (HDA_STREAM_BUF_SIZE / 2)
+ #define HDA_BDL_BLOCKSIZE           (HDA_STREAM_BUF_SIZE / HDA_BDL_ENTRY_COUNT)
+-#define HDA_STREAM_POLL_TIME        (EFI_TIMER_PERIOD_MILLISECONDS(100))
++#define HDA_STREAM_POLL_TIME        (EFI_TIMER_PERIOD_MILLISECONDS(10))
+ 
+ // DMA position structure.
+ #pragma pack(1)
+diff --git a/Platform/AudioDxe/HdaController/HdaControllerMem.c b/Platform/AudioDxe/HdaController/HdaControllerMem.c
+index 390541b..bb3637f 100644
+--- a/Platform/AudioDxe/HdaController/HdaControllerMem.c
++++ b/Platform/AudioDxe/HdaController/HdaControllerMem.c
+@@ -303,6 +303,17 @@ HdaControllerInitRirb(
+     if (EFI_ERROR(Status))
+         goto FREE_BUFFER;
+ 
++    // Response interrupt count = 1 (0 means 256). QEMU's emulation stops
++    // processing the CORB once this many responses are pending until the
++    // RIRB status is cleared, so leaving it at 0 never answers a command;
++    // responses are acknowledged in HdaControllerSendCommands.
++    {
++        UINT16 HdaRintCnt = 1;
++        Status = PciIo->Mem.Write(PciIo, EfiPciIoWidthUint16, PCI_HDA_BAR, HDA_REG_RINTCNT, 1, &HdaRintCnt);
++        if (EFI_ERROR(Status))
++            goto FREE_BUFFER;
++    }
++
+     // Populate device object properties.
+     HdaDev->RirbBuffer = RirbBuffer;
+     HdaDev->RirbEntryCount = (UINT32)(RirbLength / HDA_RIRB_ENTRY_SIZE);
+@@ -374,7 +385,10 @@ HdaControllerSetRirb(
+ 
+     // Change RIRB operation.
+     if (Enable)
+-        HdaRirbCtl |= HDA_REG_RIRBCTL_RIRBDMAEN;
++        // DMA on, plus the response interrupt enable: QEMU only flags "RINTCNT
++        // responses pending" (which SendCommands clears to keep the CORB going)
++        // when it is set. Nothing in firmware unmasks the line, so it's inert.
++        HdaRirbCtl |= HDA_REG_RIRBCTL_RIRBDMAEN | HDA_REG_RIRBCTL_RINTCTL;
+     else
+         HdaRirbCtl &= ~HDA_REG_RIRBCTL_RIRBDMAEN;
+     Status = PciIo->Mem.Write(PciIo, EfiPciIoWidthUint8, PCI_HDA_BAR, HDA_REG_RIRBCTL, 1, &HdaRirbCtl);

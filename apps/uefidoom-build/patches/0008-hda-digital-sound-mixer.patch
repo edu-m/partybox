@@ -1,0 +1,631 @@
+Sound: digital effects through AudioDxe (EFI_AUDIO_IO_PROTOCOL).
+ - new efi/i_hdasound.c: 16-channel software mixer (vanilla volume /
+   separation / pitch) into 44.1 kHz 16-bit stereo, streamed through one
+   long buffer kept two blocks ahead of the driver DMA (~90 ms latency),
+   started on the first effect and stopped after a second of silence
+ - replaces the old one-playback-per-effect code (which libsamplerate
+   resampled per effect and could only play one at a time) and the
+   interactive output prompt (getchar/scanf) that stalled startup
+ - PC speaker remains the fallback; -pcspeaker forces it
+
+diff --git a/uefidoom/doom.inf b/uefidoom/doom.inf
+index 04539dd..be042cc 100644
+--- a/uefidoom/doom.inf
++++ b/uefidoom/doom.inf
+@@ -20,6 +20,7 @@ efi/i_sound.c
+ efi/i_video.c
+ efi/i_input.c
+ efi/i_pcspeaker.c
++efi/i_hdasound.c
+ sound/samplerate.c
+ sound/src_linear.c
+ sound/src_sinc.c
+diff --git a/uefidoom/efi/i_hdasound.c b/uefidoom/efi/i_hdasound.c
+new file mode 100644
+index 0000000..66990d7
+--- /dev/null
++++ b/uefidoom/efi/i_hdasound.c
+@@ -0,0 +1,290 @@
++// Digital sound effects through AudioDxe's EFI_AUDIO_IO_PROTOCOL.
++//
++// The protocol plays one buffer at a time: the driver copies it into its DMA
++// ring block by block from a poll timer and calls back when the buffer is
++// exhausted. So we hand it one long buffer and keep mixing into it a couple
++// of blocks ahead of where the DMA is (estimated from time), which gives
++// gapless sound with roughly 4 blocks (~90 ms) of latency. The stream is
++// started when an effect starts and stopped after a second of silence.
++//
++// The mixer itself is the classic one: up to MIX_CHANNELS of Doom's 8-bit
++// 11025 Hz effects, each with left/right volume from the separation and a
++// pitch step, summed into 16-bit stereo at 44.1 kHz (4x, linear
++// interpolation) and clamped.
++
++#include <stdio.h>
++#include <string.h>
++
++#include <Uefi.h>
++#include <Library/BaseMemoryLib.h>
++#include <Library/UefiBootServicesTableLib.h>
++
++#include "doomdef.h"
++#include "doomtype.h"
++#include "sounds.h"
++#include "w_wad.h"
++#include "z_zone.h"
++#include "i_system.h"
++#include "i_sound.h"
++#include "i_hdasound.h"
++
++#define OUT_RATE        44100
++#define MIX_CHANNELS    16
++#define BLOCK_FRAMES    1024          // AudioDxe copies 4 KB blocks = 1024 stereo frames
++#define LEAD_BLOCKS     2             // keep this much mixed ahead of the DMA
++#define SRC_SECONDS     8             // buffer handed to the driver; restarted when used up
++#define SRC_FRAMES      (OUT_RATE * SRC_SECONDS)
++#define SILENCE_MS      1000          // stop the stream after this much silence
++
++typedef struct {
++	int           handle;         // 0 = free
++	const byte   *data;           // 8-bit unsigned samples
++	unsigned      length;         // in samples
++	unsigned      pos;            // 16.16 sample position
++	unsigned      step;           // 16.16 samples per output frame
++	int           lvol, rvol;     // 0..127
++} mixchan_t;
++
++static EFI_AUDIO_IO_PROTOCOL *audio;
++static UINT8    output;
++static INT16   *src;              // SRC_FRAMES * 2
++static mixchan_t chan[MIX_CHANNELS];
++static int      nextHandle = 1;
++
++static boolean  running;          // a StartPlaybackAsync is in flight
++static volatile boolean streamDone;  // set by the driver's callback
++static UINT64   startMs;          // when the current buffer was started
++static unsigned writePos;         // frames mixed into src so far
++static UINT64   lastActiveMs;
++
++static const byte *sfxData[NUMSFX];
++static unsigned    sfxLen[NUMSFX];
++
++static VOID EFIAPI StreamCallback(EFI_AUDIO_IO_PROTOCOL *AudioIo, VOID *Context)
++{
++	streamDone = true;
++}
++
++boolean I_HDA_Init(EFI_AUDIO_IO_PROTOCOL *audioIo, UINT8 outputIndex)
++{
++	EFI_STATUS st;
++	audio = audioIo;
++	output = outputIndex;
++	src = (INT16 *)Z_Malloc(SRC_FRAMES * 2 * sizeof(INT16), PU_STATIC, 0);
++	if (!src)
++		return false;
++	st = audio->SetupPlayback(audio, output, 80, EfiAudioIoFreq44kHz, EfiAudioIoBits16, 2);
++	if (EFI_ERROR(st)) {
++		printf("HDA: SetupPlayback failed: 0x%llx\n", (unsigned long long)st);
++		audio = NULL;
++		return false;
++	}
++	printf("HDA: digital sound on output %d (44.1 kHz 16-bit stereo)\n", outputIndex);
++	return true;
++}
++
++static const byte *LoadSfx(int id, unsigned *len)
++{
++	sfxinfo_t *sfx = &S_sfx[id];
++	int lump;
++	const byte *lumpdata;
++	unsigned lumplen;
++	if (sfx->link)
++		sfx = sfx->link;
++	if (sfxData[id]) {
++		*len = sfxLen[id];
++		return sfxData[id];
++	}
++	lump = I_GetSfxLumpNum(sfx);
++	if (lump < 0)
++		return NULL;
++	lumplen = W_LumpLength(lump);
++	if (lumplen <= 8)
++		return NULL;
++	lumpdata = W_CacheLumpNum(lump, PU_STATIC);
++	// DS lump: u16 format (3), u16 rate, u32 sample count, then samples.
++	sfxData[id] = lumpdata + 8;
++	sfxLen[id] = lumplen - 8;
++	*len = sfxLen[id];
++	return sfxData[id];
++}
++
++static void SetVolume(mixchan_t *c, int vol, int sep)
++{
++	// vanilla i_sound.c addsfx(): vol is 0..15, separation 0..255
++	int s = sep + 1;
++	vol *= 8;
++	c->lvol = vol - ((vol * s * s) >> 16);
++	s -= 257;
++	c->rvol = vol - ((vol * s * s) >> 16);
++	if (c->lvol < 0) c->lvol = 0;
++	if (c->rvol < 0) c->rvol = 0;
++}
++
++// 11025/44100 = 1/4 sample per frame, scaled by pitch (128 = normal).
++static unsigned PitchStep(int pitch)
++{
++	if (pitch < 1) pitch = 1;
++	return (unsigned)pitch * 128;   // (65536 / 4) * pitch / 128
++}
++
++int I_HDA_StartSound(int sfx_id, int vol, int sep, int pitch)
++{
++	mixchan_t *c = NULL;
++	unsigned len;
++	const byte *data;
++	int i;
++	if (!audio || vol <= 0 || sfx_id <= 0 || sfx_id >= NUMSFX)
++		return 0;
++	data = LoadSfx(sfx_id, &len);
++	if (!data)
++		return 0;
++	for (i = 0; i < MIX_CHANNELS; i++)
++		if (!chan[i].handle) { c = &chan[i]; break; }
++	if (!c) {   // all busy: take the one furthest along
++		unsigned best = 0;
++		for (i = 0; i < MIX_CHANNELS; i++) {
++			unsigned frac = (chan[i].pos >> 16) * 1000 / (chan[i].length ? chan[i].length : 1);
++			if (!c || frac > best) { c = &chan[i]; best = frac; }
++		}
++	}
++	c->data = data;
++	c->length = len;
++	c->pos = 0;
++	c->step = PitchStep(pitch);
++	SetVolume(c, vol, sep);
++	c->handle = nextHandle++;
++	if (nextHandle <= 0)
++		nextHandle = 1;
++	lastActiveMs = I_GetTimeMs();
++	I_HDA_Update();   // get it into the stream right away
++	return c->handle;
++}
++
++static mixchan_t *Find(int handle)
++{
++	int i;
++	if (handle <= 0) return NULL;
++	for (i = 0; i < MIX_CHANNELS; i++)
++		if (chan[i].handle == handle) return &chan[i];
++	return NULL;
++}
++
++void I_HDA_UpdateSoundParams(int handle, int vol, int sep, int pitch)
++{
++	mixchan_t *c = Find(handle);
++	if (!c) return;
++	SetVolume(c, vol, sep);
++	c->step = PitchStep(pitch);
++}
++
++void I_HDA_StopSound(int handle)
++{
++	mixchan_t *c = Find(handle);
++	if (c) c->handle = 0;
++}
++
++int I_HDA_SoundIsPlaying(int handle)
++{
++	return Find(handle) != NULL;
++}
++
++static boolean AnyActive(void)
++{
++	int i;
++	for (i = 0; i < MIX_CHANNELS; i++)
++		if (chan[i].handle) return true;
++	return false;
++}
++
++// Mix n frames into src at frame offset at.
++static void Mix(unsigned at, unsigned n)
++{
++	INT16 *out = src + (UINTN)at * 2;
++	unsigned f;
++	int i;
++	for (f = 0; f < n; f++) {
++		int l = 0, r = 0;
++		for (i = 0; i < MIX_CHANNELS; i++) {
++			mixchan_t *c = &chan[i];
++			unsigned idx, frac;
++			int s0, s1, s;
++			if (!c->handle) continue;
++			idx = c->pos >> 16;
++			if (idx + 1 >= c->length) { c->handle = 0; continue; }
++			frac = c->pos & 0xffff;
++			s0 = (int)c->data[idx] - 128;
++			s1 = (int)c->data[idx + 1] - 128;
++			s = s0 + (((s1 - s0) * (int)frac) >> 16);   // -128..127
++			l += s * c->lvol;                            // up to +-16256
++			r += s * c->rvol;
++			c->pos += c->step;
++		}
++		l <<= 1; r <<= 1;
++		if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
++		if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
++		*out++ = (INT16)l;
++		*out++ = (INT16)r;
++	}
++}
++
++static void Start(void)
++{
++	EFI_STATUS st;
++	writePos = 0;
++	Mix(0, BLOCK_FRAMES * (LEAD_BLOCKS + 1));
++	writePos = BLOCK_FRAMES * (LEAD_BLOCKS + 1);
++	streamDone = false;
++	st = audio->StartPlaybackAsync(audio, src, (UINTN)SRC_FRAMES * 4, 0, StreamCallback, NULL);
++	if (EFI_ERROR(st)) {
++		static boolean reported;
++		if (!reported) { reported = true; printf("HDA: StartPlaybackAsync failed: 0x%llx\n", (unsigned long long)st); }
++		return;
++	}
++	startMs = I_GetTimeMs();
++	running = true;
++}
++
++void I_HDA_Update(void)
++{
++	UINT64 now;
++	unsigned consumed, target;
++	if (!audio)
++		return;
++	now = I_GetTimeMs();
++	if (AnyActive())
++		lastActiveMs = now;
++
++	if (streamDone) {           // the driver used up the whole buffer
++		streamDone = false;
++		running = false;
++	}
++	if (!running) {
++		if (AnyActive())
++			Start();
++		return;
++	}
++	if (!AnyActive() && now - lastActiveMs > SILENCE_MS) {
++		audio->StopPlayback(audio);
++		running = false;
++		return;
++	}
++	// Frames the driver has copied so far: 2 blocks up front, then one block
++	// each time a block finishes playing.
++	consumed = (unsigned)((now - startMs) * OUT_RATE / 1000) + 2 * BLOCK_FRAMES;
++	target = consumed + LEAD_BLOCKS * BLOCK_FRAMES;
++	if (target > SRC_FRAMES)
++		target = SRC_FRAMES;
++	if (writePos < target) {
++		Mix(writePos, target - writePos);
++		writePos = target;
++	}
++}
++
++void I_HDA_Shutdown(void)
++{
++	if (audio && running)
++		audio->StopPlayback(audio);
++	running = false;
++	audio = NULL;
++}
+diff --git a/uefidoom/efi/i_hdasound.h b/uefidoom/efi/i_hdasound.h
+new file mode 100644
+index 0000000..e682748
+--- /dev/null
++++ b/uefidoom/efi/i_hdasound.h
+@@ -0,0 +1,17 @@
++#ifndef I_HDASOUND_H
++#define I_HDASOUND_H
++
++#include <Uefi.h>
++#include <Protocol/AudioIo.h>
++
++// Digital sound effects through an EFI_AUDIO_IO_PROTOCOL (AudioDxe): a
++// software mixer streaming 44.1 kHz 16-bit stereo. See i_hdasound.c.
++boolean I_HDA_Init (EFI_AUDIO_IO_PROTOCOL *audioIo, UINT8 outputIndex);
++int     I_HDA_StartSound (int sfx_id, int vol, int sep, int pitch);  // handle, 0 = not started
++void    I_HDA_UpdateSoundParams (int handle, int vol, int sep, int pitch);
++void    I_HDA_StopSound (int handle);
++int     I_HDA_SoundIsPlaying (int handle);
++void    I_HDA_Update (void);      // call often: keeps the stream fed
++void    I_HDA_Shutdown (void);
++
++#endif
+diff --git a/uefidoom/efi/i_sound.c b/uefidoom/efi/i_sound.c
+index a9898e7..09bfcf1 100644
+--- a/uefidoom/efi/i_sound.c
++++ b/uefidoom/efi/i_sound.c
+@@ -30,6 +30,7 @@
+ #include "m_misc.h"
+ #include "w_wad.h"
+ #include "i_pcspeaker.h"
++#include "i_hdasound.h"
+ #include <wchar.h>
+ 
+ #include "sound/common.h"
+@@ -44,116 +45,84 @@
+ 
+ EFI_AUDIO_IO_PROTOCOL *audioIo;
+ EFI_AUDIO_IO_PROTOCOL_PORT *outputPorts = NULL;
+-EFI_DEVICE_PATH_PROTOCOL *DevicePath = NULL;
+ UINTN outputCount = 0;
+ UINTN outputToUse = 0;
+ boolean outputFound = 0;
+-UINTN soundFreq = 44100;
++static boolean hdaActive = 0;
+ STATIC CHAR16 *DefaultDevices[EfiAudioIoDeviceMaximum] = { L"Line", L"Speaker", L"Headphones", L"SPDIF", L"Mic", L"HDMI", L"Other" };
+ STATIC CHAR16 *Locations[EfiAudioIoLocationMaximum] = { L"N/A", L"rear", L"front", L"left", L"right", L"top", L"bottom", L"other" };
+ STATIC CHAR16 *Surfaces[EfiAudioIoSurfaceMaximum] = { L"external", L"internal", L"other" };
+-float* floatsounddata = NULL;
+-float* floatsounddataOutput = NULL;
+-short* shortsounddataOutput = NULL;
+-int sndsfxLength[109];
+ bool soundinit = false;
+ 
+ void I_InitSound()
+ {
+-    soundinit = true;
+-    floatsounddata = calloc(MAX_UINT16,sizeof(short));
+-    floatsounddataOutput = calloc(MAX_UINT16,sizeof(short) * 2);
+-    shortsounddataOutput = calloc(MAX_UINT16,sizeof(short));
++    // Look for an HD Audio driver (AudioDxe) and pick its first line-out or
++    // speaker port, else the first port it has.
+     UINTN HandlesCount = 0;
+-    EFI_HANDLE* handles = malloc(sizeof(EFI_HANDLE) * 256);
+-    EFI_STATUS status1 = gBS->LocateHandleBuffer(ByProtocol,&gEfiAudioIoProtocolGuid,NULL,&HandlesCount,&handles);
+-    memset(&sndsfxLength[0],0,sizeof(sndsfxLength));
++    EFI_HANDLE *handles = NULL;
++    EFI_STATUS status1 = gBS->LocateHandleBuffer(ByProtocol, &gEfiAudioIoProtocolGuid, NULL, &HandlesCount, &handles);
++    soundinit = true;
+     if (!EFI_ERROR(status1))
+     {
+-        for (UINTN h = 0; h < HandlesCount; h++) 
++        for (UINTN h = 0; h < HandlesCount && !outputFound; h++)
+         {
+-            // Open Audio I/O protocol.
+             status1 = gBS->HandleProtocol(handles[h], &gEfiAudioIoProtocolGuid, (VOID**)&audioIo);
+-           // ASSERT_EFI_ERROR(status1);
+-            if (EFI_ERROR(status1))
+-                continue;
+-
+-            // Get device path.
+-            status1 = gBS->HandleProtocol(handles[h], &gEfiDevicePathProtocolGuid, (VOID**)&DevicePath);
+-           // ASSERT_EFI_ERROR(status1);
+             if (EFI_ERROR(status1))
+                 continue;
+-
+-            // Get output devices.
+             status1 = audioIo->GetOutputs(audioIo, &outputPorts, &outputCount);
+-            //ASSERT_EFI_ERROR(status1);
+-            if (EFI_ERROR(status1))
++            if (EFI_ERROR(status1) || outputCount == 0)
+                 continue;
+ 
+-            for (int o = 0; o < outputCount; o++)
++            for (UINTN o = 0; o < outputCount; o++)
+             {
+-                Print(L"Device Num: %d, output location: %s, output surface: %s, output device: %s\n",
+-                o,Locations[outputPorts[o].Location], Surfaces[outputPorts[o].Surface], DefaultDevices[outputPorts[o].Device]);
+-                Print(L"Supported Freqs: ");
+-                if (outputPorts[o].SupportedFreqs & EfiAudioIoFreq11kHz) printf("%d, ",11025);
+-                if (outputPorts[o].SupportedFreqs & EfiAudioIoFreq22kHz) printf("%d, ",22050);
+-                if (outputPorts[o].SupportedFreqs & EfiAudioIoFreq44kHz) printf("%d, ",44100);
+-                if (outputPorts[o].SupportedFreqs & EfiAudioIoFreq48kHz) printf("%d",48000);
+-                printf("\n");
+-                Print(L"Supported bit formats: ");
+-                if (outputPorts[o].SupportedBits & EfiAudioIoBits8) printf ("%d, ", 8);
+-                if (outputPorts[o].SupportedBits & EfiAudioIoBits16) printf ("%d, ", 16);
+-                if (outputPorts[o].SupportedBits & EfiAudioIoBits20) printf ("%d, ", 20);
+-                if (outputPorts[o].SupportedBits & EfiAudioIoBits24) printf ("%d, ", 24);
+-                if (outputPorts[o].SupportedBits & EfiAudioIoBits32) printf ("%d, ", 32);
++                printf("Audio output %u: %ls %ls %ls, rates:", (unsigned)o,
++                       Surfaces[outputPorts[o].Surface], Locations[outputPorts[o].Location],
++                       DefaultDevices[outputPorts[o].Device]);
++                if (outputPorts[o].SupportedFreqs & EfiAudioIoFreq11kHz) printf(" 11025");
++                if (outputPorts[o].SupportedFreqs & EfiAudioIoFreq22kHz) printf(" 22050");
++                if (outputPorts[o].SupportedFreqs & EfiAudioIoFreq44kHz) printf(" 44100");
++                if (outputPorts[o].SupportedFreqs & EfiAudioIoFreq48kHz) printf(" 48000");
++                printf(", bits:");
++                if (outputPorts[o].SupportedBits & EfiAudioIoBits8) printf(" 8");
++                if (outputPorts[o].SupportedBits & EfiAudioIoBits16) printf(" 16");
++                if (outputPorts[o].SupportedBits & EfiAudioIoBits20) printf(" 20");
++                if (outputPorts[o].SupportedBits & EfiAudioIoBits24) printf(" 24");
++                if (outputPorts[o].SupportedBits & EfiAudioIoBits32) printf(" 32");
+                 printf("\n");
+-                if (outputPorts[o].Device == EfiAudioIoDeviceLine
+-                    || outputPorts[o].Device == EfiAudioIoDeviceSpeaker)
+-                if (outputFound != true)
++                if (!outputFound
++                    && (outputPorts[o].Device == EfiAudioIoDeviceLine
++                        || outputPorts[o].Device == EfiAudioIoDeviceSpeaker))
+                 {
+-                    if (outputPorts[o].SupportedFreqs & EfiAudioIoFreq11kHz) soundFreq = 11025;
+-                    else soundFreq = 44100;
+-                    
+-                    outputToUse = o;
+                     outputFound = true;
+-                    printf("Selected output.\n");
+-                    getchar();
++                    outputToUse = o;
+                 }
+             }
+-            if (!outputFound) while (1)
++            if (!outputFound)
+             {
+-                printf("Preferred output not found. Please select a output: ");
+-                int selection;
+-                int res = scanf("%d",&selection);
+-                if (res == 0 ||
+-                    res == -1)
+-                    {
+-                        printf("Bad input. Try again");
+-                    }
+-                else
+-                {
+-                    outputFound = true;
+-                    outputToUse = selection;
+-                    break;
+-                }                
++                outputFound = true;
++                outputToUse = 0;
+             }
++            printf("Audio output %u selected.\n", (unsigned)outputToUse);
+         }
++        if (handles)
++            gBS->FreePool(handles);
+     }
+     else
+     {
+-        printf("I_InitSound: Sound not found.\n");
+-    }    
+-
++        printf("I_InitSound: no HD Audio driver (AudioDxe) loaded.\n");
++    }
+ 
+-    // No HD Audio driver (AudioDxe) around: fall back to the PC speaker,
+-    // which needs no driver at all. -pcspeaker forces it, -nopcspeaker
+-    // disables it.
+-    if ((!outputFound || M_CheckParm("-pcspeaker")) && !M_CheckParm("-nopcspeaker") && !M_CheckParm("-nosfx"))
++    // No HD Audio driver around: fall back to the PC speaker, which needs no
++    // driver at all. -pcspeaker forces it, -nopcspeaker disables it.
++    hdaActive = outputFound && !M_CheckParm("-pcspeaker") && !M_CheckParm("-nosfx")
++                && I_HDA_Init(audioIo, outputToUse);
++    if (!hdaActive && !M_CheckParm("-nopcspeaker") && !M_CheckParm("-nosfx"))
+         I_PCS_Init();
+ }
+ 
+ void I_UpdateSound(void)
+ {
++    if (hdaActive) I_HDA_Update();
+     I_PCS_Update();
+ }
+ 
+@@ -163,15 +132,9 @@ void I_SubmitSound(void)
+ 
+ void I_ShutdownSound(void)
+ {
++    I_HDA_Shutdown();
+     I_PCS_Shutdown();
+-    if (audioIo && soundinit)
+-    {
+-        soundinit = false;
+-        audioIo->StopPlayback(audioIo);
+-        free(floatsounddataOutput);
+-        free(floatsounddata);
+-        free(shortsounddataOutput);
+-    }
++    soundinit = false;
+ }
+ 
+ //
+@@ -274,61 +237,14 @@ int I_StartSound(int id,
+                  int pitch,
+                  int priority)
+ {
+-    if (!outputFound) return I_PCS_StartSound(id, vol, priority);
+-    int *length = 0;
+-    char* sampdata;
+-    char* lumpdata;
+-    int sfxlumpnum = I_GetSfxLumpNum(&S_sfx[id]);
+-    int lumplength = W_LumpLength(sfxlumpnum);
+-    int sampLength = lumplength - 8;
+-    sampdata = malloc((lumplength - 8) + 2);
+-    lumpdata = malloc(lumplength);
+-    W_ReadLump(sfxlumpnum,lumpdata);
+-    memmove(sampdata,lumpdata + 8,sampLength);
+-    unsigned int realvol = 100 * (fabs(vol) / 127.);
+-    S_sfx[id].data = getsfx(S_sfx[id].name, length);
+-    EFI_STATUS stats;
+-    if (audioIo)
+-    {
+-        EFI_STATUS res = audioIo->SetupPlayback(audioIo, outputToUse, realvol, EfiAudioIoFreq44kHz, EfiAudioIoBits8, 2);
+-        if (EFI_ERROR(res)) audioIo->SetupPlayback(audioIo, outputToUse, realvol, EfiAudioIoFreq44kHz, EfiAudioIoBits16, 2);
+-        if (sndsfxLength[id] == 0)
+-        {
+-            src_short_to_float_array((const short *)sampdata,floatsounddata,sampLength / sizeof(short));
+-            SRC_DATA data;
+-            memset(&data,0,sizeof(SRC_DATA));
+-            data.data_in = floatsounddata;
+-            data.data_out = floatsounddataOutput;
+-            data.input_frames = sampLength / sizeof(short);
+-            data.output_frames = data.input_frames * 4;
+-            data.src_ratio = 44100 / 11025;
+-            int convres = src_simple(&data,SRC_SINC_BEST_QUALITY,1);
+-            if (convres != 0)
+-            {
+-                printf("Sample rate conversion failed: %s\n",src_strerror(convres));
+-                free(lumpdata);
+-                free(sampdata);
+-                return 0;
+-            }
+-            src_float_to_short_array(floatsounddataOutput,shortsounddataOutput,data.output_frames_gen);
+-            short* outputStereo = calloc(MAX_UINT16,sizeof(short));
+-            for (int i = 0; i < data.output_frames_gen; i++)
+-            {
+-                outputStereo[i * 2] = outputStereo[i * 2 + 1] = shortsounddataOutput[i];
+-            }
+-            S_sfx[id].data = outputStereo;
+-            sndsfxLength[id] = data.output_frames_gen * 2;
+-        }
+-        stats = audioIo->StartPlaybackAsync(audioIo, S_sfx[id].data, sndsfxLength[id], 0, &I_FinishedSound, NULL); // Blast it out processed.
+-        if (EFI_ERROR(stats)) printf("Failed to play sound.\n");
+-    }
+-    free(sampdata);
+-    return id;
++    if (hdaActive) return I_HDA_StartSound(id, vol, sep, pitch);
++    return I_PCS_StartSound(id, vol, priority);
+ }
+ 
+ void I_StopSound(int handle)
+ {
+-    I_PCS_StopSound(handle);
++    if (hdaActive) I_HDA_StopSound(handle);
++    else I_PCS_StopSound(handle);
+ }
+ 
+ // Called by S_*() functions
+@@ -336,7 +252,7 @@ void I_StopSound(int handle)
+ // Returns 0 if no longer playing, 1 if playing.
+ int I_SoundIsPlaying(int handle)
+ {
+-    return I_PCS_SoundIsPlaying(handle);
++    return hdaActive ? I_HDA_SoundIsPlaying(handle) : I_PCS_SoundIsPlaying(handle);
+ }
+ 
+ // Updates the volume, separation,
+@@ -346,6 +262,7 @@ void I_UpdateSoundParams(int handle,
+                          int sep,
+                          int pitch)
+ {
++    if (hdaActive) I_HDA_UpdateSoundParams(handle, vol, sep, pitch);
+ }
+ 
+ //
+diff --git a/uefidoom/efi/i_video.c b/uefidoom/efi/i_video.c
+index 03d8a1f..52b4b8d 100644
+--- a/uefidoom/efi/i_video.c
++++ b/uefidoom/efi/i_video.c
+@@ -6,6 +6,7 @@
+ #include <m_argv.h>
+ #include "i_input.h"
+ #include "i_pcspeaker.h"
++#include "i_hdasound.h"
+ #include <doomdef.h>
+ #define STB_IMAGE_RESIZE_IMPLEMENTATION 1
+ #include "stb_image_resize.h"
+@@ -443,6 +444,7 @@ void I_FinishUpdate (void)
+ 
+ void I_ShutdownGraphics(void)
+ {
++	I_HDA_Shutdown();
+ 	I_PCS_Shutdown();
+ 	I_ShutdownInput();
+ 	gGOP->SetMode(gGOP,mode->Mode);

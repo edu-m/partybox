@@ -169,9 +169,13 @@ edk2's BaseTools if needed, fetches edk2-libc and AudioPkg at pinned commits,
 applies the [patches](apps/uefidoom-build/patches) to a copy of the sources
 (GCC portability, keeping the current video mode with a frame scaled to fit,
 playing the IWADs' v1.9 demos, real key events with WASD and a saner mouse,
-real-time pacing with the WAD in RAM and direct framebuffer drawing), and builds with edk2's `GCC` toolchain using
-[`DoomBuild.dsc`](apps/uefidoom-build/DoomBuild.dsc). Everything lands in
-`build/doomws`; the submodules stay pristine.
+real-time pacing with the WAD in RAM and direct framebuffer drawing, a
+defensive keyboard hand-back, PC speaker and HD Audio sound), and builds with
+edk2's `GCC` toolchain using [`DoomBuild.dsc`](apps/uefidoom-build/DoomBuild.dsc).
+It then builds `build/AudioDxe.efi`, the HD Audio driver the game uses for
+digital sound, from the same AudioPkg checkout plus
+[`patches-audiodxe/`](apps/uefidoom-build/patches-audiodxe). Everything lands
+in `build/doomws`; the submodules stay pristine.
 
 Use a source build rather than old prebuilt binaries. Those predate upstream's
 "Fix hang during initialization", which stops 64-bit pointers being truncated
@@ -201,6 +205,33 @@ through the firmware, with a key counting as held until its repeats stop.
   direct framebuffer or `blt` GOP) and the mouse resolution/peak movement the
   firmware reports, in the HUD message line; `-blt` forces GOP `Blt` drawing.
 
+**Sound.** Effects play through one of two paths, chosen at startup:
+
+- *HD Audio.* If an `AudioDxe` driver is loaded, `doom.efi` mixes effects in
+  software (16 voices with vanilla's volume, stereo separation and pitch) into
+  a 44.1 kHz 16-bit stereo stream to the codec's line-out or speaker port,
+  about 90 ms behind the game. Firmware never ships an HD Audio driver, so load
+  the one `make doom` builds from the shell before the game. `make esp` puts it
+  at `doom\drivers\AudioDxe.efi` (a subfolder, so partybox doesn't list it as
+  an app), and [`examples/doom-startup.nsh`](examples/doom-startup.nsh) runs
+  `load drivers\AudioDxe.efi` when it's there. The driver comes from the
+  AudioPkg fork pinned in `build.sh`, with two fixes: it never got codec
+  responses from QEMU's `intel-hda` (RIRB interrupt count 0 stalls the
+  command ring), and its end-of-stream callback used the wrong calling
+  convention and crashed. It supports the usual Realtek/Intel-style codecs;
+  check the driver's output at startup if nothing is found. USB audio is out
+  of reach: UEFI USB stacks have no isochronous transfers.
+- *PC speaker.* Otherwise the IWADs' PC-speaker versions of every effect (the
+  `DP*` lumps) are fed to the 8254 timer directly, so this works on any board
+  with a beeper wired up, with no firmware support at all. One voice, as in
+  1993.
+
+`-pcspeaker` forces the speaker even with a driver present, `-nopcspeaker`
+turns it off, `-nosfx` turns both off. There is no music (that would need an
+OPL emulator). To hear the HD Audio path in QEMU:
+`make run QEMUFLAGS="-audiodev pa,id=snd -device intel-hda -device hda-output,audiodev=snd"`
+(use `-audiodev wav,id=snd,path=out.wav` to record instead).
+
 **Performance.** The game runs in real time (tics are paced by a cycle-counter
 clock, and a slow frame no longer slows the game), each WAD is read into
 memory once so nothing touches the firmware's file I/O during play, and frames
@@ -209,10 +240,11 @@ that gives a steady 35 fps, the engine's tic rate.
 
 `doom.efi` still has to be started from a UEFI Shell, since it finds its WADs
 through the shell's current directory. Put it in a folder with the IWADs and
-a shell that `cd`s there and runs it (for example a `PlayDoom.efi` shell with a
+a shell that `cd`s there and runs it (for example a `PlayDoom.efi` shell with
+[`examples/doom-startup.nsh`](examples/doom-startup.nsh) as its
 `startup.nsh`). With a `doom/` folder like that next to the Makefile,
-`make esp` swaps in `build/doom.efi`. DOOM and the WADs aren't part of this
-repo.
+`make esp` swaps in `build/doom.efi` and adds `drivers\AudioDxe.efi`. DOOM
+and the WADs aren't part of this repo.
 
 ## Trying it in QEMU
 

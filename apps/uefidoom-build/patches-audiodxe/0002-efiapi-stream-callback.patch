@@ -1,0 +1,17 @@
+HdaCodecHdaIoStreamCallback is called through EFI_HDA_IO_STREAM_CALLBACK
+(an EFIAPI function pointer) but was defined with the native SysV
+convention, so it read its arguments from the wrong registers and
+jumped into the EFI_AUDIO_IO_PROTOCOL struct (#UD) when a stream ended.
+
+diff --git a/Platform/AudioDxe/HdaCodec/HdaCodecAudioIo.c b/Platform/AudioDxe/HdaCodec/HdaCodecAudioIo.c
+index 1a2fb12..5e5fc61 100644
+--- a/Platform/AudioDxe/HdaCodec/HdaCodecAudioIo.c
++++ b/Platform/AudioDxe/HdaCodec/HdaCodecAudioIo.c
+@@ -27,6 +27,7 @@
+ 
+ // HDA I/O Stream callback.
+ VOID
++EFIAPI
+ HdaCodecHdaIoStreamCallback(
+     IN EFI_HDA_IO_PROTOCOL_TYPE Type,
+     IN VOID *Context1,

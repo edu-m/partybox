@@ -77,3 +77,26 @@ echo ">> building doom.efi ($TARGET)"
 
 cp "$W/Build/DoomPkg/${TARGET}_GCC/X64/doom.efi" "$ROOT/build/doom.efi"
 echo ">> build/doom.efi"
+
+# ---- AudioDxe (HD Audio driver for digital sound), from the pinned AudioPkg
+# fork plus patches-audiodxe/ (QEMU compatibility, low latency).
+# (git archive: the pinned commit itself, never stray working-tree edits.)
+rm -rf "$W/src/audio"
+mkdir -p "$W/src/audio/AudioPkg"
+git -C "$W/audio/AudioPkg" archive HEAD | tar -x -C "$W/src/audio/AudioPkg"
+for p in "$HERE"/patches-audiodxe/*.patch; do
+    patch -s --batch -d "$W/src/audio/AudioPkg" -p1 < "$p"
+done
+cp "$HERE/AudioBuild.dsc" "$W/AudioBuild.dsc"
+echo ">> building AudioDxe.efi ($TARGET)"
+(
+    export WORKSPACE=$W EDK_TOOLS_PATH=$EDK2/BaseTools CONF_PATH=$W/Conf
+    export PACKAGES_PATH=$EDK2:$W/src/audio
+    cd "$EDK2"
+    set +u
+    . ./edksetup.sh BaseTools >/dev/null
+    cd "$W"
+    build -q -a X64 -t GCC -b "$TARGET" -n "$(nproc)" -p AudioBuild.dsc -m AudioPkg/Platform/AudioDxe/AudioDxe.inf
+)
+cp "$W/Build/AudioPkg/${TARGET}_GCC/X64/AudioPkg/Platform/AudioDxe/AudioDxe/OUTPUT/AudioDxe.efi" "$ROOT/build/AudioDxe.efi"
+echo ">> build/AudioDxe.efi"

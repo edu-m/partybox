@@ -1,0 +1,312 @@
+Sound: PC speaker effects from the IWAD's DP* lumps.
+ - new efi/i_pcspeaker.c: 1/140 s pitch sequences into 8254 channel 2,
+   gated by port 0x61; divisor table from DMX (via Chocolate Doom); one
+   voice with Doom priorities; serviced from the frame loop and the
+   tic wait loop; silenced on every exit path
+ - used when no AudioIo (AudioDxe) output exists; -pcspeaker forces it,
+   -nopcspeaker / -nosfx disable it
+
+diff --git a/uefidoom/d_main.c b/uefidoom/d_main.c
+index 97b8107..02e0142 100644
+--- a/uefidoom/d_main.c
++++ b/uefidoom/d_main.c
+@@ -397,6 +397,7 @@ void D_DoomLoop(void)
+ 				lasttic = nowtic - 1;
+ 			while (nowtic == lasttic)
+ 			{
++				I_UpdateSound();   // PC speaker tones are 1/140 s apart
+ 				usleep(500);
+ 				nowtic = I_GetTime();
+ 			}
+diff --git a/uefidoom/doom.inf b/uefidoom/doom.inf
+index 0fddfb4..04539dd 100644
+--- a/uefidoom/doom.inf
++++ b/uefidoom/doom.inf
+@@ -19,6 +19,7 @@ efi/i_net.c
+ efi/i_sound.c
+ efi/i_video.c
+ efi/i_input.c
++efi/i_pcspeaker.c
+ sound/samplerate.c
+ sound/src_linear.c
+ sound/src_sinc.c
+diff --git a/uefidoom/efi/i_pcspeaker.c b/uefidoom/efi/i_pcspeaker.c
+new file mode 100644
+index 0000000..d68c43c
+--- /dev/null
++++ b/uefidoom/efi/i_pcspeaker.c
+@@ -0,0 +1,172 @@
++// PC speaker sound effects.
++//
++// Doom's IWADs carry PC speaker versions of every effect (DP* lumps): a
++// 4-byte header, then one pitch byte per 1/140 s. The pitch indexes the
++// divisor table below (from DMX via Chocolate Doom's i_pcsound.c), which
++// is loaded into channel 2 of the 8254 timer; port 0x61 gates the speaker.
++// Nothing here needs a firmware driver, so it works wherever a beeper is
++// wired to the board.
++//
++// There is one voice. A new effect replaces the current one if nothing is
++// playing or if it is at least as important (Doom priorities: lower number
++// = more important), which is roughly what the original did.
++
++#include <Uefi.h>
++#include <Library/IoLib.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "doomdef.h"
++#include "doomtype.h"
++#include "sounds.h"
++#include "w_wad.h"
++#include "z_zone.h"
++#include "i_system.h"
++#include "i_pcspeaker.h"
++
++#define PIT_CTRL   0x43
++#define PIT_CH2    0x42
++#define SPK_PORT   0x61
++#define STEP_HZ    140
++
++static const UINT16 divisors[] = {
++0,
++    6818, 6628, 6449, 6279, 6087, 5906, 5736, 5575,
++    5423, 5279, 5120, 4971, 4830, 4697, 4554, 4435,
++    4307, 4186, 4058, 3950, 3836, 3728, 3615, 3519,
++    3418, 3323, 3224, 3131, 3043, 2960, 2875, 2794,
++    2711, 2633, 2560, 2485, 2415, 2348, 2281, 2213,
++    2153, 2089, 2032, 1975, 1918, 1864, 1810, 1757,
++    1709, 1659, 1612, 1565, 1521, 1478, 1435, 1395,
++    1355, 1316, 1280, 1242, 1207, 1173, 1140, 1107,
++    1075, 1045, 1015,  986,  959,  931,  905,  879,
++     854,  829,  806,  783,  760,  739,  718,  697,
++     677,  658,  640,  621,  604,  586,  570,  553,
++     538,  522,  507,  493,  479,  465,  452,  439,
++     427,  415,  403,  391,  380,  369,  359,  348,
++     339,  329,  319,  310,  302,  293,  285,  276,
++     269,  261,  253,  246,  239,  232,  226,  219,
++     213,  207,  201,  195,  190,  184,  179,
++};
++#define NUM_DIVISORS (sizeof(divisors) / sizeof(divisors[0]))
++
++static boolean enabled;
++static byte*   cur;            // tone bytes of the current effect
++static int     curLen, curPos;
++static int     curPriority;
++static int     curHandle;
++static int     nextHandle = 1;
++static int     curLumpNum = -1;
++static UINT16  curDivisor;     // what the timer is set to now (0 = silent)
++static UINT64  lastStep = (UINT64)-1;
++
++static void Tone(UINT16 divisor)
++{
++	if (divisor == curDivisor)
++		return;
++	curDivisor = divisor;
++	if (!divisor) {
++		IoWrite8(SPK_PORT, IoRead8(SPK_PORT) & ~3);   // gate off, timer output off
++		return;
++	}
++	IoWrite8(PIT_CTRL, 0xB6);                         // channel 2, lo/hi byte, square wave
++	IoWrite8(PIT_CH2, (UINT8)divisor);
++	IoWrite8(PIT_CH2, (UINT8)(divisor >> 8));
++	IoWrite8(SPK_PORT, IoRead8(SPK_PORT) | 3);
++}
++
++static void Stop(void)
++{
++	Tone(0);
++	if (curLumpNum >= 0)
++		Z_ChangeTag(cur - 4, PU_CACHE);
++	cur = NULL;
++	curLumpNum = -1;
++	curLen = curPos = 0;
++	curHandle = 0;
++}
++
++void I_PCS_Init(void)
++{
++	enabled = true;
++	Tone(0);
++	printf("PC speaker sound enabled\n");
++}
++
++int I_PCS_StartSound(int sfx_id, int vol, int priority)
++{
++	sfxinfo_t* sfx;
++	char name[9];
++	int lump;
++	byte* data;
++
++	if (!enabled || vol <= 0 || sfx_id <= 0 || sfx_id >= NUMSFX)
++		return 0;
++	sfx = &S_sfx[sfx_id];
++	if (sfx->link)
++		sfx = sfx->link;
++	if (cur && priority > curPriority)   // something more important is playing
++		return 0;
++
++	sprintf(name, "dp%s", sfx->name);
++	lump = W_CheckNumForName(name);
++	if (lump < 0)
++		return 0;
++	data = W_CacheLumpNum(lump, PU_STATIC);
++	if (!data || W_LumpLength(lump) < 4)
++		return 0;
++
++	Stop();
++	cur = data + 4;
++	curLen = data[2] | (data[3] << 8);
++	if (curLen > W_LumpLength(lump) - 4)
++		curLen = W_LumpLength(lump) - 4;
++	curPos = 0;
++	curLumpNum = lump;
++	curPriority = priority;
++	curHandle = nextHandle++;
++	if (nextHandle <= 0)
++		nextHandle = 1;
++	lastStep = (UINT64)-1;   // play the first tone right away
++	I_PCS_Update();
++	return curHandle;
++}
++
++void I_PCS_StopSound(int handle)
++{
++	if (cur && handle == curHandle)
++		Stop();
++}
++
++int I_PCS_SoundIsPlaying(int handle)
++{
++	return cur != NULL && handle == curHandle;
++}
++
++void I_PCS_Update(void)
++{
++	UINT64 step;
++	if (!enabled || !cur)
++		return;
++	step = I_GetTimeMs() * STEP_HZ / 1000;
++	if (step == lastStep)
++		return;
++	if (lastStep != (UINT64)-1 && step > lastStep + 1)
++		curPos += (int)(step - lastStep - 1);   // we are late: skip tones, keep in time
++	lastStep = step;
++	if (curPos >= curLen) {
++		Stop();
++		return;
++	}
++	{
++		unsigned tone = cur[curPos++];
++		Tone(tone < NUM_DIVISORS ? divisors[tone] : 0);
++	}
++}
++
++void I_PCS_Shutdown(void)
++{
++	if (enabled)
++		Stop();
++	enabled = false;
++}
+diff --git a/uefidoom/efi/i_pcspeaker.h b/uefidoom/efi/i_pcspeaker.h
+new file mode 100644
+index 0000000..31cc6dd
+--- /dev/null
++++ b/uefidoom/efi/i_pcspeaker.h
+@@ -0,0 +1,12 @@
++#ifndef I_PCSPEAKER_H
++#define I_PCSPEAKER_H
++
++// PC speaker sound effects (the IWAD's DP* lumps) via the 8254 timer.
++void I_PCS_Init (void);
++int  I_PCS_StartSound (int sfx_id, int vol, int priority);  // handle, 0 = not started
++void I_PCS_StopSound (int handle);
++int  I_PCS_SoundIsPlaying (int handle);
++void I_PCS_Update (void);     // call often (every frame and while waiting for a tic)
++void I_PCS_Shutdown (void);   // silence; safe to call any time
++
++#endif
+diff --git a/uefidoom/efi/i_sound.c b/uefidoom/efi/i_sound.c
+index 827c3db..a9898e7 100644
+--- a/uefidoom/efi/i_sound.c
++++ b/uefidoom/efi/i_sound.c
+@@ -29,6 +29,7 @@
+ #include "m_argv.h"
+ #include "m_misc.h"
+ #include "w_wad.h"
++#include "i_pcspeaker.h"
+ #include <wchar.h>
+ 
+ #include "sound/common.h"
+@@ -143,10 +144,17 @@ void I_InitSound()
+         printf("I_InitSound: Sound not found.\n");
+     }    
+ 
++
++    // No HD Audio driver (AudioDxe) around: fall back to the PC speaker,
++    // which needs no driver at all. -pcspeaker forces it, -nopcspeaker
++    // disables it.
++    if ((!outputFound || M_CheckParm("-pcspeaker")) && !M_CheckParm("-nopcspeaker") && !M_CheckParm("-nosfx"))
++        I_PCS_Init();
+ }
+ 
+ void I_UpdateSound(void)
+ {
++    I_PCS_Update();
+ }
+ 
+ void I_SubmitSound(void)
+@@ -155,6 +163,7 @@ void I_SubmitSound(void)
+ 
+ void I_ShutdownSound(void)
+ {
++    I_PCS_Shutdown();
+     if (audioIo && soundinit)
+     {
+         soundinit = false;
+@@ -265,7 +274,7 @@ int I_StartSound(int id,
+                  int pitch,
+                  int priority)
+ {
+-    if (!outputFound) return 0;
++    if (!outputFound) return I_PCS_StartSound(id, vol, priority);
+     int *length = 0;
+     char* sampdata;
+     char* lumpdata;
+@@ -319,6 +328,7 @@ int I_StartSound(int id,
+ 
+ void I_StopSound(int handle)
+ {
++    I_PCS_StopSound(handle);
+ }
+ 
+ // Called by S_*() functions
+@@ -326,7 +336,7 @@ void I_StopSound(int handle)
+ // Returns 0 if no longer playing, 1 if playing.
+ int I_SoundIsPlaying(int handle)
+ {
+-    return 0;
++    return I_PCS_SoundIsPlaying(handle);
+ }
+ 
+ // Updates the volume, separation,
+diff --git a/uefidoom/efi/i_video.c b/uefidoom/efi/i_video.c
+index ced94f1..03d8a1f 100644
+--- a/uefidoom/efi/i_video.c
++++ b/uefidoom/efi/i_video.c
+@@ -5,6 +5,7 @@
+ #include <i_system.h>
+ #include <m_argv.h>
+ #include "i_input.h"
++#include "i_pcspeaker.h"
+ #include <doomdef.h>
+ #define STB_IMAGE_RESIZE_IMPLEMENTATION 1
+ #include "stb_image_resize.h"
+@@ -442,6 +443,7 @@ void I_FinishUpdate (void)
+ 
+ void I_ShutdownGraphics(void)
+ {
++	I_PCS_Shutdown();
+ 	I_ShutdownInput();
+ 	gGOP->SetMode(gGOP,mode->Mode);
+ 	free(frameBuffer);

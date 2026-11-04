@@ -75,7 +75,7 @@ ESP_EXTRA ?= $(wildcard doom)
 
 esp: $(ESP)
 
-$(ESP): $(BUILD)/partybox.efi $(BUILD)/blackjack.efi tests examples/limine.conf $(shell find $(ESP_EXTRA) -type f 2>/dev/null) $(wildcard $(BUILD)/doom.efi)
+$(ESP): $(BUILD)/partybox.efi $(BUILD)/blackjack.efi tests examples/limine.conf $(shell find $(ESP_EXTRA) -type f 2>/dev/null) $(wildcard $(BUILD)/doom.efi $(BUILD)/AudioDxe.efi)
 	rm -f $@
 	mformat -C -F -i $@ -T $$(( $(ESP_MB) * 2048 )) -h 64 -s 32 ::
 	mmd -i $@ ::/EFI ::/EFI/BOOT ::/EFI/partybox ::/EFI/partybox/PARTYBOX ::/EFI/partybox/PARTYBOX/tools
@@ -90,6 +90,12 @@ $(ESP): $(BUILD)/partybox.efi $(BUILD)/blackjack.efi tests examples/limine.conf 
 	# A source-built doom.efi (make doom) replaces whatever doom/ shipped with.
 	if [ -f $(BUILD)/doom.efi ] && [ -d doom ]; then \
 		mcopy -o -i $@ $(BUILD)/doom.efi ::/EFI/partybox/PARTYBOX/doom/doom.efi; fi
+	# The HD Audio driver goes in a subfolder (not scanned by partybox) for
+	# startup.nsh to `load` before the game; see examples/doom-startup.nsh.
+	if [ -f $(BUILD)/AudioDxe.efi ] && [ -d doom ]; then \
+		mdir -i $@ ::/EFI/partybox/PARTYBOX/doom/drivers >/dev/null 2>&1 || \
+			mmd -i $@ ::/EFI/partybox/PARTYBOX/doom/drivers; \
+		mcopy -o -i $@ $(BUILD)/AudioDxe.efi ::/EFI/partybox/PARTYBOX/doom/drivers/AudioDxe.efi; fi
 
 $(BUILD)/OVMF_VARS.fd: | $(BUILD)
 	cp $(OVMF_VARS) $@
