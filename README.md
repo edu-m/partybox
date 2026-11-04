@@ -32,6 +32,12 @@ ESP
   dot-files such as macOS `._foo.efi` junk. Sorted, with file sizes.
 - Launched apps get a proper `DeviceHandle`/`FilePath`, so they can locate
   their own files (and a nested partybox works).
+- Before launching an app (and on exit), partybox checks that the firmware's
+  text console still matches the screen. If a loader's `resolution:` (or an
+  app) shrank the display behind the console's back, the console's
+  `ClearScreen` fails and text apps such as the UEFI Shell quit on startup
+  with "Invalid Parameter". partybox then has the console re-apply its own
+  graphics mode for the app, and restores partybox's mode afterwards.
 - When an app returns, partybox comes back, restores its video mode if the app
   changed it, shows the exit status (plus any exit-data string), and rescans.
 - **Autoboot**: on start, the selected entry (the first app) boots after a
@@ -132,18 +138,101 @@ enforced. Because Limine isn't signed, partybox boots directly as
 `tools/sbtest.py` is a minimal Authenticode signer for that test only; use
 `sbsign`/`sbctl` with your real keys.
 
+## Showcase apps
+
+`make` also builds **`build/blackjack.efi`** ([`apps/blackjack`](apps/blackjack)), a
+blackjack table drawn with GOP, to show what a bare-metal UEFI app can do.
+Drop it in `PARTYBOX` and launch it from the menu. It's shipped with each
+release next to `partybox.efi`.
+
+- 6-deck shoe, dealer stands on all 17s and peeks for blackjack, blackjack
+  pays 3:2, double on the first two cards (no split or insurance).
+- Start with 1,000 chips; `↑`/`↓` (`PgUp`/`PgDn`) to bet 10–500, `Enter` to
+  deal, `H`/`S`/`D` to hit, stand or double, `Esc` to go back to partybox.
+- Deliberately conservative about firmware: GOP `Blt` for output, `ConIn`
+  for input, `Stall` for pacing, nothing else. It shares partybox's
+  font/drawing code.
+
+### DOOM
+
+[Cacodemon345/uefidoom](https://github.com/Cacodemon345/uefidoom) is pinned as
+the `apps/uefidoom` submodule. `make doom` builds it on Linux into
+`build/doom.efi`:
+
+```sh
+git submodule update --init edk2 apps/uefidoom   # edk2 needs a full checkout here
+make doom
+```
+
+[`apps/uefidoom-build/build.sh`](apps/uefidoom-build/build.sh) compiles
+edk2's BaseTools if needed, fetches edk2-libc and AudioPkg at pinned commits,
+applies the [patches](apps/uefidoom-build/patches) to a copy of the sources
+(GCC portability, keeping the current video mode with a frame scaled to fit,
+playing the IWADs' v1.9 demos, real key events with WASD and a saner mouse,
+real-time pacing with the WAD in RAM and direct framebuffer drawing), and builds with edk2's `GCC` toolchain using
+[`DoomBuild.dsc`](apps/uefidoom-build/DoomBuild.dsc). Everything lands in
+`build/doomws`; the submodules stay pristine.
+
+Use a source build rather than old prebuilt binaries. Those predate upstream's
+"Fix hang during initialization", which stops 64-bit pointers being truncated
+to 32 bits. The bug is invisible in QEMU but freezes real PCs with RAM above
+4 GiB during `R_Init` (a page fault with interrupts off: even Num Lock stops
+responding). Run the `lowhog` test app first to reproduce that situation in
+QEMU (see below).
+
+**Controls.** UEFI's keyboard interface only reports keystrokes with typematic
+repeat, never key releases, and only the last key pressed repeats. So
+`doom.efi` takes USB HID boot keyboards and the PS/2 controller over from the
+firmware while it runs, which gives it real key-down/key-up events: held keys
+respond immediately and several keys work at once. The firmware drivers are
+reattached when it quits, including on errors. Any other keyboard still works
+through the firmware, with a key counting as held until its repeats stop.
+
+- W/A/S/D or the arrows to move (A/D strafe; `,`/`.` too), mouse to turn,
+  left button or Space to fire, E to use, Shift to run, 1–7 for weapons.
+- Mouse turning uses raw counts (as Chocolate Doom does); vertical mouse
+  movement doesn't walk.
+- Switches, added to the `doom.efi` line of your `startup.nsh`:
+  `-mousescale <percent>` adjusts mouse speed on top of the in-game
+  sensitivity (firmwares differ wildly in how they report mouse movement:
+  values from 50 to 3500 have been needed); `-vertmouse` re-enables walking
+  with the mouse; `-conin` skips the keyboard takeover in case some firmware
+  objects to it; `-fps` shows frames/s, ms per frame, the drawing path (`fb`
+  direct framebuffer or `blt` GOP) and the mouse resolution/peak movement the
+  firmware reports, in the HUD message line; `-blt` forces GOP `Blt` drawing.
+
+**Performance.** The game runs in real time (tics are paced by a cycle-counter
+clock, and a slow frame no longer slows the game), each WAD is read into
+memory once so nothing touches the firmware's file I/O during play, and frames
+go straight into the framebuffer when its format allows. On a typical machine
+that gives a steady 35 fps, the engine's tic rate.
+
+`doom.efi` still has to be started from a UEFI Shell, since it finds its WADs
+through the shell's current directory. Put it in a folder with the IWADs and
+a shell that `cd`s there and runs it (for example a `PlayDoom.efi` shell with a
+`startup.nsh`). With a `doom/` folder like that next to the Makefile,
+`make esp` swaps in `build/doom.efi`. DOOM and the WADs aren't part of this
+repo.
+
 ## Trying it in QEMU
 
 ```sh
-make run     # Limine → partybox → three test apps, using OVMF
+make run     # Limine → partybox → test apps and blackjack, using OVMF
+make run QEMUFLAGS="-enable-kvm -cpu host"   # faster, if KVM is available
 ```
 
-`make esp` builds `build/esp.img` with Limine (`/usr/share/limine/BOOTX64.EFI`),
-`examples/limine.conf`, partybox, and the test payloads from `test/testapp.c`:
-`hello` (prints its load path), `exitdata` (fails with an exit-data message),
-`modeswitch` (changes the GOP mode, to test that partybox restores its own),
-and `tools/nested-hello` (sub-folder app). Override `OVMF_CODE`, `OVMF_VARS`
-or `LIMINE` if your distro puts them elsewhere.
+`make esp` builds `build/esp.img` (`ESP_MB`, default 128) with Limine
+(`/usr/share/limine/BOOTX64.EFI`), `examples/limine.conf`, partybox,
+`blackjack.efi`, and the test payloads from `test/testapp.c`: `hello` (prints
+its load path), `exitdata` (fails with an exit-data message), `modeswitch`
+(changes the GOP mode, to test that partybox restores its own),
+`tools/nested-hello` (sub-folder app), and `lowhog`. `lowhog` occupies all
+RAM below 4 GiB and exits, so apps launched afterwards get memory above 4 GiB,
+as on real PCs (OVMF otherwise prefers low memory). Run it before an app that
+"works in QEMU but hangs on hardware", with e.g.
+`make run QEMU_MEM=8G QEMUFLAGS="-enable-kvm -cpu host"`. Folders listed in `ESP_EXTRA` (default:
+`doom/` if present, git-ignored) are copied into `PARTYBOX` as-is. Override
+`OVMF_CODE`, `OVMF_VARS` or `LIMINE` if your distro puts them elsewhere.
 
 ## Layout
 
@@ -154,6 +243,10 @@ or `LIMINE` if your distro puts them elsewhere.
 | `src/gfx.c` | GOP back buffer, rounded rects, alpha-blended text |
 | `src/lib.c` | freestanding libc bits, UTF-16 string helpers, GUIDs |
 | `src/font_data.h` | generated glyphs (`make font`, needs Pillow) |
+| `apps/blackjack/` | the blackjack showcase app and its generated card glyphs |
+| `apps/uefidoom/` | DOOM port (submodule, third-party, GPL-2.0) |
+| `apps/uefidoom-build/` | Linux build of it: script, `.dsc`, patches |
+| `tools/genfont.py` | glyph generator: `ui` set for partybox, `cards` set for blackjack |
 | `tools/sbtest.py` | test-only key generator and Authenticode signer for `make run-sb` |
 
 The embedded glyphs are rasterized from Noto Sans (SIL Open Font License 1.1),

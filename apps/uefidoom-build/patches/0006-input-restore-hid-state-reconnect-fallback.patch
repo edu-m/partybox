@@ -1,0 +1,156 @@
+Input: hand USB keyboards back the way the firmware left them.
+ - remember the HID protocol and idle rate (GET_PROTOCOL / GET_IDLE) before
+   switching to boot protocol, restore both at exit: a firmware driver using
+   the report protocol or periodic idle reports read garbage afterwards,
+   leaving the UEFI Shell without a keyboard on some boards
+ - only take over a device whose firmware driver was actually detached
+   (DisconnectController succeeded); let the host controller retire the
+   cancelled transfer before reconnecting
+ - if a reconnect does not bring text input back on the handle, connect all
+   handles (what the shell's "connect -r" does)
+
+diff --git a/uefidoom/efi/i_input.c b/uefidoom/efi/i_input.c
+index 02a69ed..ad6f42d 100644
+--- a/uefidoom/efi/i_input.c
++++ b/uefidoom/efi/i_input.c
+@@ -31,6 +31,7 @@
+ #include <Protocol/UsbIo.h>
+ #include <Protocol/DevicePath.h>
+ #include <Protocol/SimpleTextIn.h>
++#include <Protocol/SimpleTextInEx.h>
+ 
+ #include "doomdef.h"
+ #include "d_event.h"
+@@ -67,9 +68,50 @@ typedef struct {
+ 	EFI_HANDLE           Handle;
+ 	EFI_USB_IO_PROTOCOL *UsbIo;
+ 	UINT8                Endpoint;
++	UINT8                Interface;
++	UINT8                Protocol;    // HID protocol before we touched it (1 = report)
++	UINT8                Idle;        // idle rate before we touched it
++	boolean              HaveProtocol, HaveIdle;
+ 	UINT8                Prev[8];
+ } USB_KBD;
+ 
++// HID class requests on the keyboard interface.
++static EFI_STATUS HidRequest(USB_KBD *k, UINT8 dir, UINT8 request, UINT16 value, VOID *data, UINT16 len)
++{
++	EFI_USB_DEVICE_REQUEST req;
++	UINT32 usbStatus;
++	ZeroMem(&req, sizeof(req));
++	req.RequestType = 0x21 | dir;   // class, interface; dir 0x80 = device-to-host
++	req.Request = request;
++	req.Value = value;
++	req.Index = k->Interface;
++	req.Length = len;
++	return k->UsbIo->UsbControlTransfer(k->UsbIo, &req, len ? (dir ? EfiUsbDataIn : EfiUsbDataOut) : EfiUsbNoData,
++	                                    100, data, len, &usbStatus);
++}
++
++// Does the handle offer text input again (i.e. has the firmware's keyboard
++// driver come back)?
++static boolean HasTextInput(EFI_HANDLE h)
++{
++	VOID *p;
++	return !EFI_ERROR(gBS->HandleProtocol(h, &gEfiSimpleTextInProtocolGuid, &p)) ||
++	       !EFI_ERROR(gBS->HandleProtocol(h, &gEfiSimpleTextInputExProtocolGuid, &p));
++}
++
++// Last resort when a reconnect doesn't bring a keyboard back: connect every
++// handle in the system, like the shell's `connect -r`.
++static void ConnectAll(void)
++{
++	EFI_HANDLE *handles = NULL;
++	UINTN count = 0;
++	if (EFI_ERROR(gBS->LocateHandleBuffer(AllHandles, NULL, NULL, &count, &handles)))
++		return;
++	for (UINTN i = 0; i < count; i++)
++		gBS->ConnectController(handles[i], NULL, NULL, TRUE);
++	gBS->FreePool(handles);
++}
++
+ static USB_KBD usbKbd[MAX_USB_KBD];
+ static int     numUsbKbd;
+ 
+@@ -175,29 +217,33 @@ static void UsbTakeOver(void)
+ 		if (!ep)
+ 			continue;
+ 
+-		// Detach the firmware's keyboard driver, then talk to the device.
+-		gBS->DisconnectController(handles[i], NULL, NULL);
+-
+-		UINT32 usbStatus;
+-		EFI_USB_DEVICE_REQUEST req;
+-		ZeroMem(&req, sizeof(req));
+-		req.RequestType = 0x21;   // class, interface, host-to-device
+-		req.Index = ifd.InterfaceNumber;
+-		req.Request = 0x0B;       // SET_PROTOCOL: boot
+-		io->UsbControlTransfer(io, &req, EfiUsbNoData, 100, NULL, 0, &usbStatus);
+-		req.Request = 0x0A;       // SET_IDLE: report on change only
+-		io->UsbControlTransfer(io, &req, EfiUsbNoData, 100, NULL, 0, &usbStatus);
++		// Detach the firmware's keyboard driver. If that doesn't work, leave
++		// the device alone: two readers on one endpoint would break both.
++		if (EFI_ERROR(gBS->DisconnectController(handles[i], NULL, NULL)))
++			continue;
+ 
+ 		USB_KBD *k = &usbKbd[numUsbKbd];
+ 		ZeroMem(k, sizeof(*k));
++		k->Handle = handles[i];
++		k->UsbIo = io;
++		k->Endpoint = ep;
++		k->Interface = ifd.InterfaceNumber;
++
++		// Remember how the firmware left the device, so it gets it back that
++		// way: a driver using the report protocol or periodic idle reports
++		// would otherwise read garbage after we exit.
++		k->HaveProtocol = !EFI_ERROR(HidRequest(k, 0x80, 0x03, 0, &k->Protocol, 1));   // GET_PROTOCOL
++		k->HaveIdle = !EFI_ERROR(HidRequest(k, 0x80, 0x02, 0, &k->Idle, 1));           // GET_IDLE
++		HidRequest(k, 0, 0x0B, 0, NULL, 0);        // SET_PROTOCOL: boot
++		HidRequest(k, 0, 0x0A, 0, NULL, 0);        // SET_IDLE: report on change only
++
+ 		if (EFI_ERROR(io->UsbAsyncInterruptTransfer(io, ep, TRUE, interval, 8, UsbKbdCallback,
+ 		                                            (VOID *)(UINTN)numUsbKbd))) {
++			if (k->HaveProtocol) HidRequest(k, 0, 0x0B, k->Protocol, NULL, 0);
++			if (k->HaveIdle) HidRequest(k, 0, 0x0A, (UINT16)k->Idle << 8, NULL, 0);
+ 			gBS->ConnectController(handles[i], NULL, NULL, TRUE);   // give it back
+ 			continue;
+ 		}
+-		k->Handle = handles[i];
+-		k->UsbIo = io;
+-		k->Endpoint = ep;
+ 		numUsbKbd++;
+ 	}
+ 	gBS->FreePool(handles);
+@@ -221,11 +267,19 @@ static void UsbPoll(void)
+ 
+ static void UsbRelease(void)
+ {
++	boolean missing = false;
+ 	for (int i = 0; i < numUsbKbd; i++) {
+ 		USB_KBD *k = &usbKbd[i];
+ 		k->UsbIo->UsbAsyncInterruptTransfer(k->UsbIo, k->Endpoint, FALSE, 0, 0, NULL, NULL);
++		gBS->Stall(2000);   // let the host controller retire the transfer
++		if (k->HaveProtocol) HidRequest(k, 0, 0x0B, k->Protocol, NULL, 0);
++		if (k->HaveIdle) HidRequest(k, 0, 0x0A, (UINT16)k->Idle << 8, NULL, 0);
+ 		gBS->ConnectController(k->Handle, NULL, NULL, TRUE);
++		if (!HasTextInput(k->Handle))
++			missing = true;
+ 	}
++	if (missing)
++		ConnectAll();
+ 	numUsbKbd = 0;
+ }
+ 
+@@ -327,8 +381,11 @@ static void Ps2Poll(void)
+ 
+ static void Ps2Release(void)
+ {
+-	if (ps2Handle)
++	if (ps2Handle) {
+ 		gBS->ConnectController(ps2Handle, NULL, NULL, TRUE);
++		if (!HasTextInput(ps2Handle))
++			ConnectAll();
++	}
+ 	ps2Handle = NULL;
+ }
+ 

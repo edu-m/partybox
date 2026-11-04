@@ -1,0 +1,671 @@
+Input: real key press/release, WASD, saner mouse.
+ - new efi/i_input.c: take USB HID boot keyboards (async interrupt reports)
+   and the PS/2 controller (set-1 scancodes) over from the firmware for
+   true key-down/key-up events, so held keys respond at once and several
+   keys work together; the ConIn fallback holds a key until its repeats
+   stop. Firmware drivers are reconnected in I_ShutdownGraphics (called by
+   I_Quit and I_Error); -conin skips the takeover.
+ - stop force-releasing every key each frame (G_ResetKeycmd in D_DoomLoop)
+ - W/A/S/D move and strafe next to the arrows and , .
+ - mouse: raw counts scaled by the reported resolution relative to edk2s
+   nominal 8 and never above raw counts (was counts x4); -mousescale
+   <percent>; vertical mouse movement only with -vertmouse
+
+diff --git a/uefidoom/d_main.c b/uefidoom/d_main.c
+index cdf85a7..b83f415 100644
+--- a/uefidoom/d_main.c
++++ b/uefidoom/d_main.c
+@@ -372,7 +372,8 @@ void D_DoomLoop(void)
+ 			TryRunTics(); // will run at least one tic
+ 		}
+ 
+-		G_ResetKeycmd();
++		// (Keys used to be force-released every frame here; input now posts
++		// real key-up events, see efi/i_input.c.)
+ 
+ 		S_UpdateSounds(players[consoleplayer].mo); // move positional sounds
+ 
+diff --git a/uefidoom/doom.inf b/uefidoom/doom.inf
+index cbdde30..0fddfb4 100644
+--- a/uefidoom/doom.inf
++++ b/uefidoom/doom.inf
+@@ -18,6 +18,7 @@ efi/i_system.c
+ efi/i_net.c
+ efi/i_sound.c
+ efi/i_video.c
++efi/i_input.c
+ sound/samplerate.c
+ sound/src_linear.c
+ sound/src_sinc.c
+@@ -99,6 +100,9 @@ efi/chkstk.nasm | MSFT
+   DevShell
+   SerialPortLib
+   LibMath
++  BaseLib
++  BaseMemoryLib
++  IoLib
+ 
+ [Protocols]
+   gEfiLoadedImageProtocolGuid
+@@ -106,6 +110,9 @@ efi/chkstk.nasm | MSFT
+   gEfiSimplePointerProtocolGuid
+   gEfiSimpleTextInputExProtocolGuid
+   gEfiAudioIoProtocolGuid
++  gEfiUsbIoProtocolGuid
++  gEfiSimpleTextInProtocolGuid
++  gEfiDevicePathProtocolGuid
+ 
+ [BuildOptions]
+     *:*_*_*_CC_FLAGS      = -DNORMALUNIX
+diff --git a/uefidoom/efi/i_input.c b/uefidoom/efi/i_input.c
+new file mode 100644
+index 0000000..2893d4d
+--- /dev/null
++++ b/uefidoom/efi/i_input.c
+@@ -0,0 +1,433 @@
++// Keyboard input with real key press/release events.
++//
++// UEFI's text input protocols only deliver keystrokes (with firmware
++// typematic repeat), never releases, and only the last key pressed repeats.
++// That makes held keys stutter and makes holding two keys (W + D) impossible.
++// So, for the duration of the game, we take keyboards over from the firmware:
++//
++//  - USB HID boot keyboards: disconnect the firmware driver, switch the
++//    interface to the boot protocol and read its 8-byte reports (modifiers +
++//    up to six pressed keys) through an async interrupt transfer.
++//  - The PS/2 controller (i8042): disconnect the firmware driver and read
++//    set-1 make/break scancodes from it directly.
++//
++// Anything else (and any keyboard we fail to take over) still goes through
++// ConIn, where a key counts as held from its first keystroke until its
++// repeats stop (timings measured from the firmware's own repeat).
++//
++// -conin skips the takeover (ConIn only), in case a firmware misbehaves.
++//
++// I_ShutdownInput() reconnects the firmware drivers; it runs from
++// I_ShutdownGraphics(), which both I_Quit() and I_Error() call.
++
++#include <stdio.h>
++
++#include <Uefi.h>
++#include <Library/BaseLib.h>
++#include <Library/BaseMemoryLib.h>
++#include <Library/IoLib.h>
++#include <Library/UefiBootServicesTableLib.h>
++#include <Library/UefiRuntimeServicesTableLib.h>
++#include <Protocol/UsbIo.h>
++#include <Protocol/DevicePath.h>
++#include <Protocol/SimpleTextIn.h>
++
++#include "doomdef.h"
++#include "d_event.h"
++#include "d_main.h"
++#include "i_input.h"
++
++#define NUM_DOOM_KEYS 256
++
++extern int I_ScanCode2DoomCode(int a);   // set-1 scancode -> doom key (i_video.c)
++
++static void post(evtype_t type, int key)
++{
++	event_t ev;
++	if (!key)
++		return;
++	ev.type = type;
++	ev.data1 = key;
++	ev.data2 = ev.data3 = 0;
++	D_PostEvent(&ev);
++}
++
++// ---- timing (for the ConIn fallback) --------------------------------------
++static UINT64 tscPerMs = 1;
++
++static UINT64 NowMs(void)
++{
++	return AsmReadTsc() / tscPerMs;
++}
++
++// ---- USB HID boot keyboards -------------------------------------------------
++#define MAX_USB_KBD   4
++#define RING_SIZE     64
++
++typedef struct {
++	EFI_HANDLE           Handle;
++	EFI_USB_IO_PROTOCOL *UsbIo;
++	UINT8                Endpoint;
++	UINT8                Prev[8];
++} USB_KBD;
++
++static USB_KBD usbKbd[MAX_USB_KBD];
++static int     numUsbKbd;
++
++// Reports arrive in a callback (at the host controller's TPL); queue them.
++static struct { UINT8 Kbd; UINT8 Report[8]; } ring[RING_SIZE];
++static volatile UINT32 ringHead;
++static UINT32 ringTail;
++
++static EFI_STATUS EFIAPI UsbKbdCallback(VOID *Data, UINTN DataLength, VOID *Context, UINT32 Status)
++{
++	if (Status != EFI_USB_NOERROR || Data == NULL || DataLength < 8)
++		return EFI_SUCCESS;
++	UINT32 slot = ringHead % RING_SIZE;
++	ring[slot].Kbd = (UINT8)(UINTN)Context;
++	CopyMem(ring[slot].Report, Data, 8);
++	ringHead++;
++	return EFI_SUCCESS;
++}
++
++// HID usage page 7 -> doom key
++static int HidToDoom(UINT8 u)
++{
++	static const char punct[] = { '-', '=', '[', ']', '\\', 0, ';', '\'', '`', ',', '.', '/' };
++	if (u >= 0x04 && u <= 0x1D) return 'a' + (u - 0x04);
++	if (u >= 0x1E && u <= 0x26) return '1' + (u - 0x1E);
++	if (u >= 0x3A && u <= 0x43) return KEY_F1 + (u - 0x3A);
++	if (u >= 0x2D && u <= 0x38) return punct[u - 0x2D];
++	switch (u) {
++	case 0x27: return '0';
++	case 0x28: case 0x58: return KEY_ENTER;
++	case 0x29: return KEY_ESCAPE;
++	case 0x2A: return KEY_BACKSPACE;
++	case 0x2B: return KEY_TAB;
++	case 0x2C: return ' ';
++	case 0x44: return KEY_F11;
++	case 0x45: return KEY_F12;
++	case 0x48: return KEY_PAUSE;
++	case 0x4F: return KEY_RIGHTARROW;
++	case 0x50: return KEY_LEFTARROW;
++	case 0x51: return KEY_DOWNARROW;
++	case 0x52: return KEY_UPARROW;
++	case 0x56: return KEY_MINUS;   // keypad -
++	case 0x57: return KEY_EQUALS;  // keypad +
++	default:   return 0;
++	}
++}
++
++static boolean Contains(const UINT8 *keys, UINT8 u)
++{
++	for (int i = 0; i < 6; i++)
++		if (keys[i] == u)
++			return true;
++	return false;
++}
++
++static void UsbDiff(USB_KBD *k, const UINT8 *rep)
++{
++	static const struct { UINT8 mask; int key; } mods[] = {
++		{ 0x11, KEY_RCTRL }, { 0x22, KEY_RSHIFT }, { 0x44, KEY_RALT },
++	};
++	if (rep[2] == 0x01)   // ErrorRollOver: too many keys, report is meaningless
++		return;
++	for (int i = 0; i < 3; i++) {
++		boolean was = (k->Prev[0] & mods[i].mask) != 0, now = (rep[0] & mods[i].mask) != 0;
++		if (was != now)
++			post(now ? ev_keydown : ev_keyup, mods[i].key);
++	}
++	for (int i = 2; i < 8; i++)
++		if (k->Prev[i] && !Contains(rep + 2, k->Prev[i]))
++			post(ev_keyup, HidToDoom(k->Prev[i]));
++	for (int i = 2; i < 8; i++)
++		if (rep[i] && !Contains(k->Prev + 2, rep[i]))
++			post(ev_keydown, HidToDoom(rep[i]));
++	CopyMem(k->Prev, rep, 8);
++}
++
++static void UsbTakeOver(void)
++{
++	EFI_HANDLE *handles = NULL;
++	UINTN count = 0;
++	if (EFI_ERROR(gBS->LocateHandleBuffer(ByProtocol, &gEfiUsbIoProtocolGuid, NULL, &count, &handles)))
++		return;
++
++	for (UINTN i = 0; i < count && numUsbKbd < MAX_USB_KBD; i++) {
++		EFI_USB_IO_PROTOCOL *io;
++		EFI_USB_INTERFACE_DESCRIPTOR ifd;
++		if (EFI_ERROR(gBS->HandleProtocol(handles[i], &gEfiUsbIoProtocolGuid, (VOID **)&io)) ||
++		    EFI_ERROR(io->UsbGetInterfaceDescriptor(io, &ifd)))
++			continue;
++		if (ifd.InterfaceClass != 3 || ifd.InterfaceSubClass != 1 || ifd.InterfaceProtocol != 1)
++			continue;   // not a HID boot keyboard
++
++		UINT8 ep = 0, interval = 8;
++		for (UINT8 e = 0; e < ifd.NumEndpoints; e++) {
++			EFI_USB_ENDPOINT_DESCRIPTOR epd;
++			if (!EFI_ERROR(io->UsbGetEndpointDescriptor(io, e, &epd)) &&
++			    (epd.EndpointAddress & 0x80) && (epd.Attributes & 0x03) == 0x03) {
++				ep = epd.EndpointAddress;
++				interval = epd.Interval ? epd.Interval : 8;
++				break;
++			}
++		}
++		if (!ep)
++			continue;
++
++		// Detach the firmware's keyboard driver, then talk to the device.
++		gBS->DisconnectController(handles[i], NULL, NULL);
++
++		UINT32 usbStatus;
++		EFI_USB_DEVICE_REQUEST req;
++		ZeroMem(&req, sizeof(req));
++		req.RequestType = 0x21;   // class, interface, host-to-device
++		req.Index = ifd.InterfaceNumber;
++		req.Request = 0x0B;       // SET_PROTOCOL: boot
++		io->UsbControlTransfer(io, &req, EfiUsbNoData, 100, NULL, 0, &usbStatus);
++		req.Request = 0x0A;       // SET_IDLE: report on change only
++		io->UsbControlTransfer(io, &req, EfiUsbNoData, 100, NULL, 0, &usbStatus);
++
++		USB_KBD *k = &usbKbd[numUsbKbd];
++		ZeroMem(k, sizeof(*k));
++		if (EFI_ERROR(io->UsbAsyncInterruptTransfer(io, ep, TRUE, interval, 8, UsbKbdCallback,
++		                                            (VOID *)(UINTN)numUsbKbd))) {
++			gBS->ConnectController(handles[i], NULL, NULL, TRUE);   // give it back
++			continue;
++		}
++		k->Handle = handles[i];
++		k->UsbIo = io;
++		k->Endpoint = ep;
++		numUsbKbd++;
++	}
++	gBS->FreePool(handles);
++}
++
++static void UsbPoll(void)
++{
++	while (ringTail != ringHead) {
++		UINT8 kbd, rep[8];
++		EFI_TPL old = gBS->RaiseTPL(TPL_NOTIFY);
++		if (ringHead - ringTail > RING_SIZE)   // overrun: skip to the oldest kept
++			ringTail = ringHead - RING_SIZE;
++		kbd = ring[ringTail % RING_SIZE].Kbd;
++		CopyMem(rep, ring[ringTail % RING_SIZE].Report, 8);
++		ringTail++;
++		gBS->RestoreTPL(old);
++		if (kbd < numUsbKbd)
++			UsbDiff(&usbKbd[kbd], rep);
++	}
++}
++
++static void UsbRelease(void)
++{
++	for (int i = 0; i < numUsbKbd; i++) {
++		USB_KBD *k = &usbKbd[i];
++		k->UsbIo->UsbAsyncInterruptTransfer(k->UsbIo, k->Endpoint, FALSE, 0, 0, NULL, NULL);
++		gBS->ConnectController(k->Handle, NULL, NULL, TRUE);
++	}
++	numUsbKbd = 0;
++}
++
++// ---- PS/2 (i8042) ---------------------------------------------------------
++#define I8042_DATA    0x60
++#define I8042_STATUS  0x64
++#define I8042_OBF     0x01   // output buffer full
++#define I8042_IBF     0x02   // input buffer full
++#define I8042_AUX     0x20   // byte is from the mouse
++
++static EFI_HANDLE ps2Handle;
++static int ps2Skip;          // remaining bytes of a Pause sequence
++static boolean ps2Ext;       // last byte was 0xE0
++
++static boolean IsPs2Keyboard(EFI_HANDLE h)
++{
++	EFI_DEVICE_PATH_PROTOCOL *dp;
++	if (EFI_ERROR(gBS->HandleProtocol(h, &gEfiDevicePathProtocolGuid, (VOID **)&dp)))
++		return false;
++	for (; !(dp->Type == END_DEVICE_PATH_TYPE && dp->SubType == END_ENTIRE_DEVICE_PATH_SUBTYPE);
++	     dp = (EFI_DEVICE_PATH_PROTOCOL *)((UINT8 *)dp + (dp->Length[0] | (dp->Length[1] << 8)))) {
++		if ((dp->Length[0] | (dp->Length[1] << 8)) < 4)
++			break;
++		if (dp->Type == ACPI_DEVICE_PATH && dp->SubType == ACPI_DP) {
++			UINT32 hid = ((ACPI_HID_DEVICE_PATH *)dp)->HID;
++			if (hid == EISA_PNP_ID(0x0303) || hid == EISA_PNP_ID(0x030B))
++				return true;
++		}
++	}
++	return false;
++}
++
++static boolean I8042Wait(UINT8 mask, boolean set)
++{
++	for (int i = 0; i < 10000; i++) {
++		if (((IoRead8(I8042_STATUS) & mask) != 0) == set)
++			return true;
++		gBS->Stall(10);
++	}
++	return false;
++}
++
++// Is the controller translating to scancode set 1? (We only decode set 1.)
++static boolean I8042Translating(void)
++{
++	while (IoRead8(I8042_STATUS) & I8042_OBF)
++		IoRead8(I8042_DATA);
++	if (!I8042Wait(I8042_IBF, false))
++		return false;
++	IoWrite8(I8042_STATUS, 0x20);   // read controller configuration byte
++	if (!I8042Wait(I8042_OBF, true))
++		return false;
++	return (IoRead8(I8042_DATA) & 0x40) != 0;
++}
++
++static void Ps2TakeOver(void)
++{
++	EFI_HANDLE *handles = NULL;
++	UINTN count = 0;
++	if (EFI_ERROR(gBS->LocateHandleBuffer(ByProtocol, &gEfiSimpleTextInProtocolGuid, NULL, &count, &handles)))
++		return;
++	for (UINTN i = 0; i < count && !ps2Handle; i++) {
++		if (!IsPs2Keyboard(handles[i]))
++			continue;
++		if (EFI_ERROR(gBS->DisconnectController(handles[i], NULL, NULL)))
++			continue;
++		if (!I8042Translating()) {
++			gBS->ConnectController(handles[i], NULL, NULL, TRUE);
++			continue;
++		}
++		ps2Handle = handles[i];
++	}
++	gBS->FreePool(handles);
++}
++
++static void Ps2Poll(void)
++{
++	for (int n = 0; n < 64; n++) {
++		UINT8 st = IoRead8(I8042_STATUS);
++		if (!(st & I8042_OBF) || (st & I8042_AUX))   // nothing, or a mouse byte: leave it
++			break;
++		UINT8 b = IoRead8(I8042_DATA);
++		if (ps2Skip) { ps2Skip--; continue; }
++		if (b == 0xE1) {                          // Pause: E1 1D 45 E1 9D C5, make only
++			ps2Skip = 5;
++			post(ev_keydown, KEY_PAUSE);
++			post(ev_keyup, KEY_PAUSE);
++			continue;
++		}
++		if (b == 0xE0) { ps2Ext = true; continue; }
++		boolean ext = ps2Ext;
++		ps2Ext = false;
++		UINT8 sc = b & 0x7F;
++		if (ext && (sc == 0x2A || sc == 0x36))   // fake shifts around extended keys
++			continue;
++		post((b & 0x80) ? ev_keyup : ev_keydown, I_ScanCode2DoomCode(sc));
++	}
++}
++
++static void Ps2Release(void)
++{
++	if (ps2Handle)
++		gBS->ConnectController(ps2Handle, NULL, NULL, TRUE);
++	ps2Handle = NULL;
++}
++
++// ---- ConIn fallback ---------------------------------------------------------
++// A key is held from its first keystroke until its repeats stop. The hold
++// windows adapt to the firmware's repeat delay and rate as they are seen.
++static struct { boolean down; UINT64 until, first, last; int repeats; } held[NUM_DOOM_KEYS];
++static UINT64 firstHoldMs = 600, repeatHoldMs = 120;
++
++static UINT64 Clamp(UINT64 v, UINT64 lo, UINT64 hi) { return v < lo ? lo : v > hi ? hi : v; }
++
++static int ConInToDoom(const EFI_INPUT_KEY *k)
++{
++	switch (k->ScanCode) {
++	case SCAN_UP:    return KEY_UPARROW;
++	case SCAN_DOWN:  return KEY_DOWNARROW;
++	case SCAN_LEFT:  return KEY_LEFTARROW;
++	case SCAN_RIGHT: return KEY_RIGHTARROW;
++	case SCAN_ESC:   return KEY_ESCAPE;
++	case SCAN_PAUSE: return KEY_PAUSE;
++	case SCAN_F11:   return KEY_F11;
++	case SCAN_F12:   return KEY_F12;
++	default:
++		if (k->ScanCode >= SCAN_F1 && k->ScanCode <= SCAN_F10)
++			return KEY_F1 + (k->ScanCode - SCAN_F1);
++		break;
++	}
++	switch (k->UnicodeChar) {
++	case CHAR_BACKSPACE:       return KEY_BACKSPACE;
++	case CHAR_TAB:             return KEY_TAB;
++	case CHAR_LINEFEED:
++	case CHAR_CARRIAGE_RETURN: return KEY_ENTER;
++	default:
++		if (k->UnicodeChar >= 'A' && k->UnicodeChar <= 'Z')
++			return k->UnicodeChar + ('a' - 'A');
++		return k->UnicodeChar < 0x80 ? k->UnicodeChar : 0;
++	}
++}
++
++static void ConInPoll(void)
++{
++	EFI_INPUT_KEY k;
++	UINT64 now = NowMs();
++	while (!EFI_ERROR(gST->ConIn->ReadKeyStroke(gST->ConIn, &k))) {
++		int key = ConInToDoom(&k);
++		if (key <= 0 || key >= NUM_DOOM_KEYS)
++			continue;
++		post(ev_keydown, key);   // also on repeats, so menus auto-repeat
++		if (!held[key].down) {
++			held[key].down = true;
++			held[key].first = held[key].last = now;
++			held[key].repeats = 0;
++			held[key].until = now + firstHoldMs;
++			continue;
++		}
++		held[key].repeats++;
++		if (held[key].repeats == 1)        // first repeat: learn the repeat delay
++			firstHoldMs = Clamp(now - held[key].first + 80, 150, 1000);
++		else if (held[key].repeats == 2)   // second: learn the repeat rate
++			repeatHoldMs = Clamp((now - held[key].last) * 3 + 20, 60, 250);
++		held[key].last = now;
++		held[key].until = now + repeatHoldMs;
++	}
++	for (int key = 0; key < NUM_DOOM_KEYS; key++)
++		if (held[key].down && now > held[key].until) {
++			held[key].down = false;
++			post(ev_keyup, key);
++		}
++}
++
++// ---- public --------------------------------------------------------------
++void I_InitInput(boolean takeover)
++{
++	UINT64 t0 = AsmReadTsc();
++	gBS->Stall(10000);
++	tscPerMs = (AsmReadTsc() - t0) / 10;
++	if (!tscPerMs)
++		tscPerMs = 1;
++
++	if (takeover) {
++		UsbTakeOver();
++		Ps2TakeOver();
++	}
++	printf("Input: %d USB keyboard(s), %s, ConIn fallback\n", numUsbKbd,
++	       ps2Handle ? "PS/2 keyboard" : "no PS/2 keyboard");
++}
++
++void I_PollInput(void)
++{
++	if (numUsbKbd)
++		UsbPoll();
++	if (ps2Handle)
++		Ps2Poll();
++	ConInPoll();
++}
++
++void I_ShutdownInput(void)
++{
++	UsbRelease();
++	Ps2Release();
++}
+diff --git a/uefidoom/efi/i_input.h b/uefidoom/efi/i_input.h
+new file mode 100644
+index 0000000..31935c1
+--- /dev/null
++++ b/uefidoom/efi/i_input.h
+@@ -0,0 +1,9 @@
++#ifndef I_INPUT_H
++#define I_INPUT_H
++
++// Real key press/release events from USB/PS2 keyboards (see i_input.c).
++void I_InitInput(boolean takeover);  // false: ConIn only (-conin)
++void I_PollInput(void);      // posts ev_keydown / ev_keyup
++void I_ShutdownInput(void);  // gives the keyboards back to the firmware
++
++#endif
+diff --git a/uefidoom/efi/i_video.c b/uefidoom/efi/i_video.c
+index ea45e8b..9c67625 100644
+--- a/uefidoom/efi/i_video.c
++++ b/uefidoom/efi/i_video.c
+@@ -3,6 +3,8 @@
+ #include <d_event.h>
+ #include <d_main.h>
+ #include <i_system.h>
++#include <m_argv.h>
++#include "i_input.h"
+ #include <doomdef.h>
+ #define STB_IMAGE_RESIZE_IMPLEMENTATION 1
+ #include "stb_image_resize.h"
+@@ -43,6 +45,10 @@ static EFI_KEY_DATA keydata[4096];
+ static unsigned int keycounter;
+ /* Integer scale of the 320x200 frame; picked at init to fit the current mode. */
+ #define MAX_FRAME_SCALE 4
++/* Mouse: percent of the default gain (-mousescale N), vertical movement opt-in (-vertmouse). */
++static int mouseScale = 100;
++static boolean vertMouse = false;
++static INT64 mouseRemX, mouseRemY;
+ static UINT32 frameScale = 2;
+ 
+ static int xlatekey(EFI_INPUT_KEY* efiKey);
+@@ -317,6 +323,14 @@ void I_InitGraphics (void)
+ 	printf("DOOM display %dx%d\n", SCREENWIDTH, SCREENHEIGHT);
+ 	printf("Frame buffer: top = %d, left = %d, width = %d, height = %d\n", frameTop, frameLeft, frameWidth, frameHeight);
+ 
++	{
++		int p = M_CheckParm("-mousescale");
++		if (p && p < myargc - 1 && atoi(myargv[p + 1]) > 0)
++			mouseScale = atoi(myargv[p + 1]);
++		vertMouse = M_CheckParm("-vertmouse") != 0;
++	}
++	I_InitInput(M_CheckParm("-conin") == 0);
++
+ 	gST->ConOut->EnableCursor(gST->ConOut, FALSE);
+ 	gST->ConOut->ClearScreen(gST->ConOut);
+ }
+@@ -361,6 +375,7 @@ void I_FinishUpdate (void)
+ 
+ void I_ShutdownGraphics(void)
+ {
++	I_ShutdownInput();
+ 	gGOP->SetMode(gGOP,mode->Mode);
+ 	free(frameBuffer);
+ 	free(screens[0]);
+@@ -534,53 +549,37 @@ int microseconds = 0;
+ //
+ void I_StartTic (void)
+ {
+-	// Get all pending input events
+-	//IoWrite8(0x60,1 | (1 << 6));
+-	EFI_STATUS status = EFI_SUCCESS;
+-	EFI_INPUT_KEY inputKey;
+-	while (1)
++	if (gMouseProtocol)
+ 	{
+-		event_t event;
+-		if (gMouseProtocol)
++		EFI_SIMPLE_POINTER_STATE state;
++		if (!EFI_ERROR(gMouseProtocol->GetState(gMouseProtocol, &state)))
+ 		{
+-			EFI_SIMPLE_POINTER_STATE state;
+-			status = gMouseProtocol->GetState(gMouseProtocol,&state);
+-			if (EFI_ERROR(status))
+-			{
+-			
+-			}
+-			else
+-			{
+-				//AsciiPrint("Mouse delta X: %d, Mouse delta Y: %d",state.RelativeMovementX,state.RelativeMovementY);
+-				event.type = ev_mouse;
+-				event.data1  = (state.LeftButton == 1);
+-				event.data1 |= (state.RightButton == 1 ? 2 : 0);
+-				event.data2 = state.RelativeMovementX * 4;
+-				event.data3 = -state.RelativeMovementY * 4;
+-				D_PostEvent(&event);
+-			}
++			// Firmware reports counts plus a nominal resolution (edk2: 8 for USB,
++			// 4 for PS/2, whatever the real DPI). Scale relative to 8, so a USB
++			// mouse gives raw counts like Chocolate Doom, but never amplify
++			// (some firmware reports odd small values); keep the remainder so
++			// slow movements aren't lost.
++			INT64 resx = gMouseProtocol->Mode->ResolutionX > 8 ? gMouseProtocol->Mode->ResolutionX : 8;
++			INT64 resy = gMouseProtocol->Mode->ResolutionY > 8 ? gMouseProtocol->Mode->ResolutionY : 8;
++			INT64 nx = (INT64)state.RelativeMovementX * 8 * mouseScale + mouseRemX;
++			INT64 ny = (INT64)state.RelativeMovementY * 8 * mouseScale + mouseRemY;
++			event_t event;
++			event.type = ev_mouse;
++			event.data1  = (state.LeftButton == 1);
++			event.data1 |= (state.RightButton == 1 ? 2 : 0);
++			event.data2 = (int)(nx / (resx * 100));
++			mouseRemX = nx % (resx * 100);
++			// Vertical mouse walks forward/back in vanilla Doom; with WASD that
++			// mostly gets in the way, so it is off unless -vertmouse is given.
++			event.data3 = vertMouse ? -(int)(ny / (resy * 100)) : 0;
++			mouseRemY = vertMouse ? ny % (resy * 100) : 0;
++			D_PostEvent(&event);
+ 		}
+-
+-		status = gST->ConIn->ReadKeyStroke(gST->ConIn, &inputKey);
+-		if (status == EFI_NOT_READY)
+-		{
+-			// No more key strokes
+-			break;
+-		}
+-		else if (EFI_ERROR(status))
+-		{
+-			printf("Failed to get key stroke: 0x%x\n", status);
+-			break;
+-		}
+-		
+-
+-		// Post pressed event (handle released event later).
+-		event.type = ev_keydown;
+-		event.data1 = xlatekey(&inputKey);
+-		D_PostEvent(&event);
+ 	}
+-}
+ 
++	// Keyboard: real press/release events (USB/PS2), ConIn as fallback.
++	I_PollInput();
++}
+ 
+ void I_UpdateNoBlit(void)
+ {
+diff --git a/uefidoom/g_game.c b/uefidoom/g_game.c
+index 8717e3e..42eab2a 100644
+--- a/uefidoom/g_game.c
++++ b/uefidoom/g_game.c
+@@ -312,12 +312,12 @@ void G_BuildTiccmd (ticcmd_t* cmd)
+ 	    cmd->angleturn += angleturn[tspeed]; 
+     } 
+  
+-    if (gamekeydown[KEY_UPARROW]) 
++    if (gamekeydown[KEY_UPARROW] || gamekeydown['w']) 
+     {
+ 	// fprintf(stderr, "up\n");
+ 	forward += forwardmove[speed]; 
+     }
+-    if (gamekeydown[KEY_DOWNARROW]) 
++    if (gamekeydown[KEY_DOWNARROW] || gamekeydown['s']) 
+     {
+ 	// fprintf(stderr, "down\n");
+ 	forward -= forwardmove[speed]; 
+@@ -326,9 +326,9 @@ void G_BuildTiccmd (ticcmd_t* cmd)
+ 	forward += forwardmove[speed]; 
+     if (joyymove > 0) 
+ 	forward -= forwardmove[speed]; 
+-    if (gamekeydown['.']) 
++    if (gamekeydown['.'] || gamekeydown['d']) 
+ 	side += sidemove[speed]; 
+-    if (gamekeydown[',']) 
++    if (gamekeydown[','] || gamekeydown['a']) 
+ 	side -= sidemove[speed];
+     
+     // buttons

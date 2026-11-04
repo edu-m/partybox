@@ -1,0 +1,82 @@
+Portability fixes for building uefidoom with GCC:
+ - declare G_ResetKeycmd and I_Error where they are used (no implicit decls)
+ - EFIAPI on the audio callback and ShellAppMain prototype (MS ABI; only
+   identical by accident under MSVC)
+ - explicit casts for intentional pointer-type conversions
+
+diff --git a/uefidoom/efi/i_sound.c b/uefidoom/efi/i_sound.c
+index fa61459..827c3db 100644
+--- a/uefidoom/efi/i_sound.c
++++ b/uefidoom/efi/i_sound.c
+@@ -247,7 +247,7 @@ getsfx(char *sfxname,
+ }
+ UINTN SoundPlaybackHandles = 0;
+ char* calldata = {0};
+-void I_FinishedSound(IN EFI_AUDIO_IO_PROTOCOL *AudioIo, IN VOID *Context)
++VOID EFIAPI I_FinishedSound(IN EFI_AUDIO_IO_PROTOCOL *AudioIo, IN VOID *Context)
+ {
+ 
+ }
+@@ -285,7 +285,7 @@ int I_StartSound(int id,
+         if (EFI_ERROR(res)) audioIo->SetupPlayback(audioIo, outputToUse, realvol, EfiAudioIoFreq44kHz, EfiAudioIoBits16, 2);
+         if (sndsfxLength[id] == 0)
+         {
+-            src_short_to_float_array(sampdata,floatsounddata,sampLength / sizeof(short));
++            src_short_to_float_array((const short *)sampdata,floatsounddata,sampLength / sizeof(short));
+             SRC_DATA data;
+             memset(&data,0,sizeof(SRC_DATA));
+             data.data_in = floatsounddata;
+diff --git a/uefidoom/efi/i_system.c b/uefidoom/efi/i_system.c
+index 4fb9b6f..691f79e 100644
+--- a/uefidoom/efi/i_system.c
++++ b/uefidoom/efi/i_system.c
+@@ -206,6 +206,7 @@ void I_Error (char *error, ...)
+   
+ extern
+ INTN
++EFIAPI
+ ShellAppMain (
+   IN UINTN Argc,
+   IN CHAR16 **Argv
+@@ -223,7 +224,7 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE handle, EFI_SYSTEM_TABLE* st)
+ 	SerialPortInitialize();
+ 	SerialPortWrite(msg, strlen(msg));
+ 	const CHAR16* argv[] = {L"doom.exe", NULL};
+-	return ShellAppMain(1, argv);
++	return ShellAppMain(1, (CHAR16 **)argv);
+ }
+ 
+ 
+diff --git a/uefidoom/efi/i_video.c b/uefidoom/efi/i_video.c
+index d498d7f..9cf330b 100644
+--- a/uefidoom/efi/i_video.c
++++ b/uefidoom/efi/i_video.c
+@@ -2,6 +2,7 @@
+ #include <v_video.h>
+ #include <d_event.h>
+ #include <d_main.h>
++#include <i_system.h>
+ #include <doomdef.h>
+ #define STB_IMAGE_RESIZE_IMPLEMENTATION 1
+ #include "stb_image_resize.h"
+@@ -144,7 +145,7 @@ static void EnumerateGraphics(void)
+ 	for(i = 0; i < count; ++i)
+ 	{
+ 		EFI_GRAPHICS_OUTPUT_PROTOCOL* gop;
+-		status = gBS->HandleProtocol(handles[i], &gEfiGraphicsOutputProtocolGuid, &gop);
++		status = gBS->HandleProtocol(handles[i], &gEfiGraphicsOutputProtocolGuid, (VOID **)&gop);
+ 		if (EFI_ERROR(status))
+ 		{
+ 			printf("Failed to handle GOP on handle %p\n", handles[i]);
+diff --git a/uefidoom/g_game.h b/uefidoom/g_game.h
+index d84916c..92df8fa 100644
+--- a/uefidoom/g_game.h
++++ b/uefidoom/g_game.h
+@@ -38,6 +38,7 @@ void G_InitNew (skill_t skill, int episode, int map);
+ // Can be called by the startup code or M_Responder.
+ // A normal game starts at map 1,
+ // but a warp test can start elsewhere
++void G_ResetKeycmd (void);
+ void G_DeferedInitNew (skill_t skill, int episode, int map);
+ 
+ void G_DeferedPlayDemo (char* demo);

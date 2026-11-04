@@ -160,11 +160,24 @@ void gfx_round_rect(struct gfx *g, int x, int y, int w, int h, int r, color_t c)
     }
 }
 
-static const struct glyph *find_glyph(const struct font *f, CHAR16 cp) {
-    if (cp >= 32 && cp < 127) return &f->glyphs[cp - 32]; /* ASCII is stored first, in order */
-    for (int i = 95; i < f->count; i++)
+/* UI fonts store ASCII first, in order, so most lookups are direct; small
+ * special-purpose fonts (e.g. card suits) hold arbitrary glyph sets. */
+static const struct glyph *lookup(const struct font *f, CHAR16 cp) {
+    if (cp >= 32 && cp < 127 && cp - 32 < f->count && f->glyphs[cp - 32].cp == cp)
+        return &f->glyphs[cp - 32];
+    for (int i = 0; i < f->count; i++)
         if (f->glyphs[i].cp == cp) return &f->glyphs[i];
-    return &f->glyphs['?' - 32];
+    return NULL;
+}
+
+static const struct glyph *find_glyph(const struct font *f, CHAR16 cp) {
+    const struct glyph *g = lookup(f, cp);
+    if (!g) g = lookup(f, '?');
+    return g ? g : &f->glyphs[0];
+}
+
+const struct glyph *gfx_glyph(const struct font *f, CHAR16 cp) {
+    return find_glyph(f, cp);
 }
 
 static void draw_glyph(struct gfx *g, const struct font *f, const struct glyph *gl, int x, int y, color_t c) {

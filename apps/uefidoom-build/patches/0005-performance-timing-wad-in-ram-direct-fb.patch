@@ -1,0 +1,506 @@
+Performance: real-time pacing, WAD in RAM, direct framebuffer, -fps.
+ - I_GetTime from the TSC (calibrated against Stall), monotonic at 35 Hz;
+   the RTC version had whole-second resolution and jumped back each minute
+ - D_DoomLoop runs the tics real time asks for (max 4 catch-up) and draws
+   once, instead of sleeping 1/35 s + one tic (game speed depended on frame
+   time); the screen melt is paced the same way
+ - each WAD is read into memory once; lumps no longer go through the
+   firmware file I/O mid-game (that was the stutter). Zone 20 -> 64 MB
+ - frames are written straight into a 32-bit RGB/BGR framebuffer, one
+   expanded line copied frameScale times; GOP Blt stays as fallback (-blt)
+ - -fps: HUD line with fps, ms/frame, drawing path, and the mouse resolution
+   and peak movement the firmware reports (for -mousescale)
+ - drop the mis-armed timer event and the per-call mallocs in I_GetTime
+
+diff --git a/uefidoom/d_main.c b/uefidoom/d_main.c
+index b83f415..97b8107 100644
+--- a/uefidoom/d_main.c
++++ b/uefidoom/d_main.c
+@@ -312,19 +312,49 @@ void D_Display(void)
+ 
+ 	do
+ 	{
+-		/*do
++		do
+ 		{
++			usleep(500);
+ 			nowtime = I_GetTime();
+ 			tics = nowtime - wipestart;
+-		} while (!tics);*/
+-		usleep((1000 * 1000) / 35);
+-		done = wipe_ScreenWipe(wipe_Melt, 0, 0, SCREENWIDTH, SCREENHEIGHT, 1);
++		} while (!tics);
++		wipestart = nowtime;
++		done = wipe_ScreenWipe(wipe_Melt, 0, 0, SCREENWIDTH, SCREENHEIGHT, tics);
+ 		I_UpdateNoBlit();
+ 		M_Drawer();		  // menu is drawn even on top of wipes
+ 		I_FinishUpdate(); // page flip or blit buffer
+ 	} while (!done);
+ }
+ 
++// -fps: once a second, put frames/s, ms per frame, the drawing path, and the
++// mouse resolution and peak movement the firmware reports (for calibrating
++// -mousescale) in the HUD message line.
++static boolean showfps;
++static char fpsmsg[96];
++
++static void D_FrameStats(void)
++{
++	static unsigned long long last;
++	static int frames;
++	unsigned long long now;
++
++	if (!showfps)
++		return;
++	frames++;
++	now = I_GetTimeMs();
++	if (now - last < 1000)
++		return;
++	if (last)
++	{
++		// keep it short: the HUD line is 320 pixels wide
++		sprintf(fpsmsg, "%dfps %dms %s res %d pk %d", frames,
++		        (int)((now - last) / frames), I_VideoPath(), I_MouseResolution(), I_MousePeak());
++		players[consoleplayer].message = fpsmsg;
++	}
++	last = now;
++	frames = 0;
++}
++
+ //
+ //  D_DoomLoop
+ //
+@@ -346,6 +376,7 @@ void D_DoomLoop(void)
+ 	}
+ 
+ 	I_InitGraphics();
++	showfps = M_CheckParm("-fps") != 0;
+ 
+ 	while (1)
+ 	{
+@@ -355,17 +386,39 @@ void D_DoomLoop(void)
+ 		// process one or more tics
+ 		if (singletics)
+ 		{
+-			//NanoSecondDelay((1000 * 1000 * 1000)/TICRATE);
+-			usleep((1000 * 1000) / 35);
+-			I_StartTic();
+-			D_ProcessEvents();
+-			G_BuildTiccmd(&netcmds[consoleplayer][maketic % BACKUPTICS]);
+-			if (advancedemo)
+-				D_DoAdvanceDemo();
+-			M_Ticker();
+-			G_Ticker();
+-			gametic++;
+-			maketic++;
++			// Run the tics real time asks for, then draw once. Catch up by at
++			// most 4 so a slow frame can't snowball. (This used to sleep a
++			// fixed 1/35 s and run one tic per frame, so the game ran slower
++			// than real time by however long drawing took.)
++			static int lasttic = -1;
++			int nowtic = I_GetTime();
++			int count;
++			if (lasttic < 0)
++				lasttic = nowtic - 1;
++			while (nowtic == lasttic)
++			{
++				usleep(500);
++				nowtic = I_GetTime();
++			}
++			count = nowtic - lasttic;
++			if (count > 4)
++			{
++				count = 4;
++				lasttic = nowtic - 4;
++			}
++			for (; count > 0; count--)
++			{
++				I_StartTic();
++				D_ProcessEvents();
++				G_BuildTiccmd(&netcmds[consoleplayer][maketic % BACKUPTICS]);
++				if (advancedemo)
++					D_DoAdvanceDemo();
++				M_Ticker();
++				G_Ticker();
++				gametic++;
++				maketic++;
++				lasttic++;
++			}
+ 		}
+ 		else
+ 		{
+@@ -379,6 +432,7 @@ void D_DoomLoop(void)
+ 
+ 		// Update display, next frame, with current state.
+ 		D_Display();
++		D_FrameStats();
+ 
+ #ifndef SNDSERV
+ 		// Sound mixing for the buffer is snychronous.
+diff --git a/uefidoom/efi/i_input.c b/uefidoom/efi/i_input.c
+index 2893d4d..02a69ed 100644
+--- a/uefidoom/efi/i_input.c
++++ b/uefidoom/efi/i_input.c
+@@ -35,6 +35,7 @@
+ #include "doomdef.h"
+ #include "d_event.h"
+ #include "d_main.h"
++#include "i_system.h"
+ #include "i_input.h"
+ 
+ #define NUM_DOOM_KEYS 256
+@@ -53,11 +54,9 @@ static void post(evtype_t type, int key)
+ }
+ 
+ // ---- timing (for the ConIn fallback) --------------------------------------
+-static UINT64 tscPerMs = 1;
+-
+ static UINT64 NowMs(void)
+ {
+-	return AsmReadTsc() / tscPerMs;
++	return I_GetTimeMs();
+ }
+ 
+ // ---- USB HID boot keyboards -------------------------------------------------
+@@ -403,12 +402,6 @@ static void ConInPoll(void)
+ // ---- public --------------------------------------------------------------
+ void I_InitInput(boolean takeover)
+ {
+-	UINT64 t0 = AsmReadTsc();
+-	gBS->Stall(10000);
+-	tscPerMs = (AsmReadTsc() - t0) / 10;
+-	if (!tscPerMs)
+-		tscPerMs = 1;
+-
+ 	if (takeover) {
+ 		UsbTakeOver();
+ 		Ps2TakeOver();
+diff --git a/uefidoom/efi/i_system.c b/uefidoom/efi/i_system.c
+index 691f79e..3cd3948 100644
+--- a/uefidoom/efi/i_system.c
++++ b/uefidoom/efi/i_system.c
+@@ -20,12 +20,13 @@
+ #endif
+ #include "i_system.h"
+ #include <Uefi.h>
++#include <Library/BaseLib.h>
+ #include <Library/UefiLib.h>
+ #include <Library/UefiRuntimeServicesTableLib.h>
+ #include <Library/UefiRuntimeLib.h>
+ #include <Library/UefiBootServicesTableLib.h>
+ 
+-int	mb_used = 20;
++int	mb_used = 64;	// RAM is plentiful here; a small zone re-reads lumps mid-game
+ 
+ 
+ void
+@@ -58,45 +59,37 @@ byte* I_ZoneBase (int*	size)
+ 
+ //
+ // I_GetTime
+-// returns time in 1/70th second tics
++// returns time in 1/35th second tics
+ //
+-// [Cacodemon345] Rely upon the EFI Runtime Services GetTime function.
++// The RTC only has whole seconds on most firmware (and the old code used
++// just its Second field, jumping back every minute), so time comes from the
++// CPU's cycle counter, calibrated once against the firmware's Stall().
++//
++static UINT64 tscPerMs;
++static UINT64 tscBase;
+ 
+-int  I_GetTime (void)
++static void I_InitClock (void)
+ {
+-    struct timeval	tp;
+-    //struct timezone	tzp;
+-    int			newtics;
+-    static int		basetime=0;
+-    EFI_TIME *time = malloc(sizeof(EFI_TIME));
+-    memset(time,0,sizeof(EFI_TIME));
+-    EFI_TIME_CAPABILITIES *timecaps = malloc(sizeof(EFI_TIME_CAPABILITIES));
+-    memset(timecaps,0,sizeof(EFI_TIME_CAPABILITIES));
+-    EFI_STATUS status;
+-    if (gST) status = gST->RuntimeServices->GetTime(time,timecaps);    
+-    if (!EFI_ERROR (status))
+-    {
+-        tp.tv_sec = time->Second;
+-        tp.tv_usec = time->Nanosecond / 1000;
+-    }
+-    else 
+-    {
+-        gettimeofday(&tp, NULL);
+-    }
+-    if (!basetime)
+-	basetime = tp.tv_sec;
+-    newtics = (tp.tv_sec-basetime)*TICRATE + tp.tv_usec*TICRATE/1000000;
+-    free(time);
+-    free(timecaps);
+-    return newtics;
++    UINT64 t0 = AsmReadTsc ();
++    gBS->Stall (20000);
++    tscPerMs = (AsmReadTsc () - t0) / 20;
++    if (!tscPerMs)
++	tscPerMs = 1;
++    tscBase = AsmReadTsc ();
+ }
+-int nano100ticks = 0;
+-void EFIAPI I_TickTime(IN EFI_EVENT Event, IN VOID *Context)
++
++unsigned long long I_GetTimeMs (void)
++{
++    if (!tscPerMs)
++	I_InitClock ();
++    return (AsmReadTsc () - tscBase) / tscPerMs;
++}
++
++int  I_GetTime (void)
+ {
+-    nano100ticks++;
+-    AsciiPrint("Ticks passed: %d",nano100ticks);
++    return (int)(I_GetTimeMs () * TICRATE / 1000);
+ }
+-EFI_EVENT timerEvent = 0;
++
+ //
+ // I_Init
+ //
+@@ -104,8 +97,6 @@ void I_Init (void)
+ {
+     gBS->SetWatchdogTimer(0,0,0,NULL);
+     I_InitSound();
+-    gBS->CreateEvent(EVT_TIMER | EVT_NOTIFY_SIGNAL | EVT_NOTIFY_WAIT,TPL_CALLBACK,(EFI_EVENT_NOTIFY)&I_TickTime,NULL,&timerEvent);
+-    gBS->SetTimer(&timerEvent,TimerPeriodic,1);
+     //  I_InitGraphics();
+ }
+ #include "w_wad.h"
+diff --git a/uefidoom/efi/i_video.c b/uefidoom/efi/i_video.c
+index 9c67625..ced94f1 100644
+--- a/uefidoom/efi/i_video.c
++++ b/uefidoom/efi/i_video.c
+@@ -18,6 +18,7 @@
+ #include <Protocol/SimpleTextInEx.h>
+ #include <Protocol/SimplePointer.h>
+ #include <Library/IoLib.h>
++#include <Library/BaseMemoryLib.h>
+ #include <Library/UefiLib.h>
+ 
+ ////////////////////////////////////////////////////////////////////
+@@ -49,6 +50,17 @@ static unsigned int keycounter;
+ static int mouseScale = 100;
+ static boolean vertMouse = false;
+ static INT64 mouseRemX, mouseRemY;
++static INT32 mousePeak;        /* largest |RelativeMovementX| since last read (-fps) */
++
++/* Direct framebuffer drawing (when the mode is plain 32-bit RGB/BGR; -blt
++ * forces GOP Blt). The firmware's Blt is a second full copy of every frame
++ * and is often slow on real GOP drivers. */
++static boolean fbDirect;
++static boolean fbRgb;          /* red in the low byte (else blue) */
++static UINT32 *fbBase;
++static UINT32 fbStride;        /* pixels per scan line */
++static UINT32 gPalette32[256]; /* palette in the framebuffer's byte order */
++static UINT32 *lineBuf;        /* one expanded line */
+ static UINT32 frameScale = 2;
+ 
+ static int xlatekey(EFI_INPUT_KEY* efiKey);
+@@ -193,6 +205,48 @@ void GopBltRender(void)
+ 	}
+ }
+ 
++// Expand each 320-pixel line once, then copy it frameScale times straight
++// into the framebuffer: sequential 64-bit writes, which write-combined
++// framebuffers like; never read it back.
++void FbRender(void)
++{
++	byte* src = screens[0];
++	UINT32* dst = fbBase + (UINTN)frameTop * fbStride + frameLeft;
++	UINTN x, y, k;
++	for (y = 0; y < SCREENHEIGHT; y++)
++	{
++		UINT32* lp = lineBuf;
++		for (x = 0; x < SCREENWIDTH; x++)
++		{
++			UINT32 c = gPalette32[*src++];
++			for (k = 0; k < frameScale; k++)
++				*lp++ = c;
++		}
++		for (k = 0; k < frameScale; k++)
++		{
++			CopyMem(dst, lineBuf, (UINTN)frameWidth * 4);
++			dst += fbStride;
++		}
++	}
++}
++
++const char* I_VideoPath(void)
++{
++	return fbDirect ? "fb" : "blt";
++}
++
++int I_MouseResolution(void)
++{
++	return gMouseProtocol ? (int)gMouseProtocol->Mode->ResolutionX : -1;
++}
++
++int I_MousePeak(void)
++{
++	int p = mousePeak;
++	mousePeak = 0;
++	return p;
++}
++
+ EFI_STATUS EFIAPI I_KeyNotify(EFI_KEY_DATA* keydata)
+ {
+ 	event_t event;
+@@ -302,7 +356,20 @@ void I_InitGraphics (void)
+ 	}
+ 
+ 	// Pick frame render func
+-	gRenderFunc = GopBltRender;
++	{
++		EFI_GRAPHICS_OUTPUT_MODE_INFORMATION* info = gGOP->Mode->Info;
++		UINT64 need = ((UINT64)(frameTop + frameHeight - 1) * info->PixelsPerScanLine + frameLeft + frameWidth) * 4;
++		fbRgb = info->PixelFormat == PixelRedGreenBlueReserved8BitPerColor;
++		fbDirect = (fbRgb || info->PixelFormat == PixelBlueGreenRedReserved8BitPerColor)
++			&& gGOP->Mode->FrameBufferBase != 0 && need <= gGOP->Mode->FrameBufferSize
++			&& !M_CheckParm("-blt");
++		fbBase = (UINT32*)(UINTN)gGOP->Mode->FrameBufferBase;
++		fbStride = info->PixelsPerScanLine;
++		lineBuf = (UINT32*)malloc(sizeof(UINT32) * frameWidth);
++		if (!lineBuf)
++			fbDirect = false;
++	}
++	gRenderFunc = fbDirect ? FbRender : GopBltRender;
+ 
+ 	// Allocate pixel screen
+ 	screens[0] = (unsigned char *) malloc (SCREENWIDTH * SCREENHEIGHT); // byte per pixel?
+@@ -399,6 +466,8 @@ void I_SetPalette (byte* palette)
+ 	size_t i = 0;
+ 	for (i = 0; i < 256; ++i)
+ 	{
++		UINT32 r = palette[0], g = palette[1], b = palette[2];
++		gPalette32[i] = fbRgb ? (r | (g << 8) | (b << 16)) : (b | (g << 8) | (r << 16));
+ 		gPalette[i].Red = *palette++;
+ 		gPalette[i].Green = *palette++;
+ 		gPalette[i].Blue = *palette++;
+@@ -563,6 +632,8 @@ void I_StartTic (void)
+ 			INT64 resy = gMouseProtocol->Mode->ResolutionY > 8 ? gMouseProtocol->Mode->ResolutionY : 8;
+ 			INT64 nx = (INT64)state.RelativeMovementX * 8 * mouseScale + mouseRemX;
+ 			INT64 ny = (INT64)state.RelativeMovementY * 8 * mouseScale + mouseRemY;
++			if (state.RelativeMovementX > mousePeak) mousePeak = state.RelativeMovementX;
++			if (-state.RelativeMovementX > mousePeak) mousePeak = -state.RelativeMovementX;
+ 			event_t event;
+ 			event.type = ev_mouse;
+ 			event.data1  = (state.LeftButton == 1);
+diff --git a/uefidoom/i_system.h b/uefidoom/i_system.h
+index 8954140..e4f1361 100644
+--- a/uefidoom/i_system.h
++++ b/uefidoom/i_system.h
+@@ -44,6 +44,9 @@ byte*	I_ZoneBase (int *size);
+ // returns current time in tics.
+ int I_GetTime (void);
+ 
++// Monotonic milliseconds (EFI port: TSC calibrated against Stall).
++unsigned long long I_GetTimeMs (void);
++
+ 
+ //
+ // Called by D_DoomLoop,
+diff --git a/uefidoom/i_video.h b/uefidoom/i_video.h
+index ba8569b..1dde1f2 100644
+--- a/uefidoom/i_video.h
++++ b/uefidoom/i_video.h
+@@ -36,6 +36,12 @@
+ // and sets up the video mode
+ void I_InitGraphics (void);
+ 
++// EFI port: how frames reach the screen ("fb" direct / "blt" GOP) and the
++// pointer resolution the firmware reports (-1: no mouse). For -fps.
++const char* I_VideoPath (void);
++int I_MouseResolution (void);
++int I_MousePeak (void);        // largest |dx| reported since last call
++
+ 
+ void I_ShutdownGraphics(void);
+ 
+diff --git a/uefidoom/w_wad.c b/uefidoom/w_wad.c
+index 52ea3a9..7979500 100644
+--- a/uefidoom/w_wad.c
++++ b/uefidoom/w_wad.c
+@@ -138,6 +138,7 @@ char*			reloadname;
+ 
+ void W_AddFile (char *filename)
+ {
++    unsigned char*	filedata;
+     wadinfo_t		header;
+     lumpinfo_t*		lump_p;
+     unsigned		i;
+@@ -210,12 +211,42 @@ void W_AddFile (char *filename)
+     lump_p = &lumpinfo[startlump];
+ 	
+     storehandle = reloadname ? -1 : handle;
++
++    // Keep the whole file in memory. Lumps used to be read on demand through
++    // the firmware's file I/O, which is slow enough to stutter mid-game.
++    filedata = NULL;
++    if (!reloadname)
++    {
++	int total = filelength (handle);
++	filedata = malloc (total);
++	if (filedata)
++	{
++	    int got = 0;
++	    lseek (handle, 0, SEEK_SET);
++	    while (got < total)
++	    {
++		int chunk = total - got > (1 << 20) ? (1 << 20) : total - got;
++		int c = read (handle, filedata + got, chunk);
++		if (c <= 0)
++		    break;
++		got += c;
++	    }
++	    if (got < total)
++	    {
++		free (filedata);
++		filedata = NULL;
++	    }
++	}
++	if (!filedata)
++	    printf (" (couldn't keep %s in memory, reading lumps from disk)\n", filename);
++    }
+ 	
+     for (i=startlump ; i<numlumps ; i++,lump_p++, fileinfo++)
+     {
+ 	lump_p->handle = storehandle;
+ 	lump_p->position = LONG(fileinfo->filepos);
+ 	lump_p->size = LONG(fileinfo->size);
++	lump_p->data = filedata;
+ 	memcpy (lump_p->name, fileinfo->name, 8);
+     }
+ 	
+@@ -444,6 +475,12 @@ W_ReadLump
+ 
+     l = lumpinfo+lump;
+ 	
++    if (l->data)
++    {
++	memcpy (dest, l->data + l->position, l->size);
++	return;
++    }
++
+     // ??? I_BeginRead ();
+ 	
+     if (l->handle == -1)
+diff --git a/uefidoom/w_wad.h b/uefidoom/w_wad.h
+index db1faaa..008d4a9 100644
+--- a/uefidoom/w_wad.h
++++ b/uefidoom/w_wad.h
+@@ -59,6 +59,7 @@ typedef struct
+     int		handle;
+     int		position;
+     int		size;
++    unsigned char* data;	// whole file in memory, or NULL to read via handle
+ } lumpinfo_t;
+ 
+ 

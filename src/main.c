@@ -152,8 +152,15 @@ static void set_msg(struct ui *u, color_t c, const CHAR16 *a, const CHAR16 *b, c
 
 static void append_status(CHAR16 *buf, size_t cap, EFI_STATUS st) {
     const CHAR16 *s = status_str(st);
-    if (s) wappend(buf, cap, s);
-    else wappend_hex(buf, cap, st);
+    if (s) {
+        wappend(buf, cap, s);
+    } else if ((int64_t)st < 0 && (int64_t)st >= -4096) {
+        /* Not an EFI status: a C program's exit(-N), sign-extended. */
+        wappend(buf, cap, L"exit code -");
+        wappend_u64(buf, cap, (uint64_t)(-(int64_t)st));
+    } else {
+        wappend_hex(buf, cap, st);
+    }
 }
 
 /* ---- rendering -------------------------------------------------------- */
@@ -526,6 +533,28 @@ static EFI_STATUS read_file(EFI_HANDLE fs, const CHAR16 *path, void **data, UINT
     return st;
 }
 
+/* Hand the text console over in a usable state. If a loader (e.g. Limine's
+ * `resolution:`) or an app switched GOP to a smaller mode behind the
+ * firmware's graphics console, the console still uses its old, larger text
+ * grid: ClearScreen then fails with INVALID_PARAMETER, and text apps such as
+ * the UEFI Shell give up on startup. Re-selecting the same text mode only
+ * clears again, but switching to another one and back makes the console
+ * re-apply the graphics mode it was built for. */
+static void prepare_console(void) {
+    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *o = gST->ConOut;
+    o->SetAttribute(o, EFI_TEXT_ATTR(EFI_LIGHTGRAY, EFI_BLACK));
+    if (!EFI_ERROR(o->ClearScreen(o))) return;
+
+    INT32 cur = o->Mode->Mode;
+    for (INT32 m = 0; m < o->Mode->MaxMode; m++) {
+        UINTN cols, rows;
+        if (m == cur || EFI_ERROR(o->QueryMode(o, (UINTN)m, &cols, &rows))) continue;
+        if (!EFI_ERROR(o->SetMode(o, (UINTN)m))) break;
+    }
+    if (cur >= 0) o->SetMode(o, (UINTN)cur);
+    o->ClearScreen(o);
+}
+
 static void restore_screen(struct ui *u) {
     gST->ConIn->Reset(gST->ConIn, FALSE); /* drop keys the app left behind */
     gST->ConOut->EnableCursor(gST->ConOut, FALSE);
@@ -564,8 +593,7 @@ static void launch(struct ui *u, const struct app *a) {
         goto out;
     }
 
-    gST->ConOut->SetAttribute(gST->ConOut, EFI_TEXT_ATTR(EFI_LIGHTGRAY, EFI_BLACK));
-    gST->ConOut->ClearScreen(gST->ConOut);
+    prepare_console();
     gST->ConOut->EnableCursor(gST->ConOut, TRUE);
 
     UINTN exit_size = 0;
@@ -817,8 +845,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
         draw(&u);
     }
 
-    gST->ConOut->SetAttribute(gST->ConOut, EFI_TEXT_ATTR(EFI_LIGHTGRAY, EFI_BLACK));
-    gST->ConOut->ClearScreen(gST->ConOut);
+    prepare_console();
     gST->ConOut->EnableCursor(gST->ConOut, TRUE);
     scan_free(&u.scan);
     xfree(u.rows);

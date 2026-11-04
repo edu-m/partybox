@@ -2,6 +2,8 @@
  *   -DMODE_HELLO       print where we were loaded from, wait for a key, return success
  *   -DMODE_EXITDATA    return EFI_ABORTED with an exit-data string
  *   -DMODE_MODESWITCH  switch to another GOP mode, wait for a key, return
+ *   -DMODE_LOWHOG      occupy RAM below 4 GiB so later allocations land above it,
+ *                      like on PCs with lots of RAM (OVMF otherwise prefers low memory)
  */
 #include "lib.h"
 
@@ -70,6 +72,43 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     wappend(buf, 64, L"x");
     wappend_u64(buf, 64, gop->Mode->Info->VerticalResolution);
     puts16(buf);
+    wait_key();
+    return EFI_SUCCESS;
+#elif defined(MODE_LOWHOG)
+    /* Pages an application allocates stay allocated after it exits, so
+     * everything started afterwards has to be served from above 4 GiB. A
+     * small reserve is handed back for firmware buffers that must stay low. */
+    CHAR16 buf[96];
+    void *probe = NULL;
+    gBS->AllocatePool(EfiLoaderData, 16 << 20, &probe);
+    wcopy(buf, 96, L"16 MiB pool before: ");
+    wappend_hex(buf, 96, (UINTN)probe);
+    puts16(buf);
+    puts16(L"\r\n");
+    gBS->FreePool(probe);
+
+    EFI_PHYSICAL_ADDRESS reserve = 0xFFFFFFFF;
+    UINTN reserve_pages = (4 << 20) / 4096;
+    bool have_reserve = !EFI_ERROR(gBS->AllocatePages(AllocateMaxAddress, EfiLoaderData, reserve_pages, &reserve));
+    uint64_t taken = 0;
+    for (UINTN chunk = 4096; chunk >= 1; chunk /= 2) { /* 16 MiB chunks down to single pages */
+        for (;;) {
+            EFI_PHYSICAL_ADDRESS a = 0xFFFFFFFF;
+            if (EFI_ERROR(gBS->AllocatePages(AllocateMaxAddress, EfiLoaderData, chunk, &a))) break;
+            taken += chunk;
+        }
+    }
+    if (have_reserve) gBS->FreePages(reserve, reserve_pages);
+
+    probe = NULL;
+    gBS->AllocatePool(EfiLoaderData, 16 << 20, &probe);
+    wcopy(buf, 96, L"occupied below 4 GiB: ");
+    wappend_u64(buf, 96, taken * 4096 >> 20);
+    wappend(buf, 96, L" MiB\r\n16 MiB pool after:  ");
+    wappend_hex(buf, 96, (UINTN)probe);
+    puts16(buf);
+    puts16((UINTN)probe >> 32 ? L"  (above 4 GiB)\r\n" : L"  (still below 4 GiB)\r\n");
+    gBS->FreePool(probe);
     wait_key();
     return EFI_SUCCESS;
 #else

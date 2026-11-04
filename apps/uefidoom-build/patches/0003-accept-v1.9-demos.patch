@@ -1,0 +1,28 @@
+Play the IWADs v1.9 attract-mode demos (linuxdoom is v1.10, same format)
+instead of printing "Demo is from a different game version!".
+
+diff --git a/uefidoom/g_game.c b/uefidoom/g_game.c
+index 87114cc..8717e3e 100644
+--- a/uefidoom/g_game.c
++++ b/uefidoom/g_game.c
+@@ -1598,11 +1598,16 @@ void G_DoPlayDemo (void)
+ 	 
+     gameaction = ga_nothing; 
+     demobuffer = demo_p = W_CacheLumpName (defdemoname, PU_STATIC); 
+-    if ( *demo_p++ != VERSION)
++    /* linuxdoom is v1.10, but the IWADs' attract-mode demos were recorded
++     * with v1.9 (109) in the same format; accept both. */
+     {
+-      fprintf( stderr, "Demo is from a different game version!\n");
+-      gameaction = ga_nothing;
+-      return;
++      byte demover = *demo_p++;
++      if (demover != VERSION && demover != 109)
++      {
++        fprintf( stderr, "Demo is from a different game version!\n");
++        gameaction = ga_nothing;
++        return;
++      }
+     }
+     
+     skill = *demo_p++; 

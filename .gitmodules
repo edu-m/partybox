@@ -1,3 +1,6 @@
 [submodule "edk2"]
 	path = edk2
 	url = https://github.com/tianocore/edk2.git
+[submodule "apps/uefidoom"]
+	path = apps/uefidoom
+	url = https://github.com/Cacodemon345/uefidoom.git

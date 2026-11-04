@@ -1,0 +1,91 @@
+Video: keep the current GOP mode and scale the frame to fit it.
+ - drop SetMode(0): mode 0 is unspecified and may be smaller than the frame,
+   which made every Blt fail ("Blit failed" flooding the console)
+ - integer frame scale chosen from the current resolution (max 4), centred
+ - clear the screen once, so loader/shell leftovers do not frame the game
+ - report a failed Blt once, with status and geometry
+
+diff --git a/uefidoom/efi/i_video.c b/uefidoom/efi/i_video.c
+index 9cf330b..ea45e8b 100644
+--- a/uefidoom/efi/i_video.c
++++ b/uefidoom/efi/i_video.c
+@@ -41,7 +41,9 @@ static FrameRenderFptr gRenderFunc = NULL;
+ static boolean getInput = true;
+ static EFI_KEY_DATA keydata[4096];
+ static unsigned int keycounter;
+-#define FRAME_SCALE 2
++/* Integer scale of the 320x200 frame; picked at init to fit the current mode. */
++#define MAX_FRAME_SCALE 4
++static UINT32 frameScale = 2;
+ 
+ static int xlatekey(EFI_INPUT_KEY* efiKey);
+ 
+@@ -173,7 +175,15 @@ void GopBltRender(void)
+ 
+ 	if (EFI_ERROR(status))
+ 	{
+-		printf("Blit failed\n");
++		/* Report once with the details instead of flooding the console. */
++		static boolean reported = false;
++		if (!reported)
++		{
++			reported = true;
++			printf("GOP Blt failed: 0x%llx (frame %ux%u at %u,%u on a %ux%u mode)\n",
++				(unsigned long long)status, frameWidth, frameHeight, frameLeft, frameTop,
++				gGOP->Mode->Info->HorizontalResolution, gGOP->Mode->Info->VerticalResolution);
++		}
+ 	}
+ }
+ 
+@@ -263,17 +273,27 @@ void I_InitGraphics (void)
+ 		}
+ 	}*/
+ 	mode = gGOP->Mode;
+-	status = gGOP->SetMode(gGOP, 0);
+-	if (EFI_ERROR(status))
++	/* Keep the mode we were started in. Forcing mode 0 is not portable: the
++	 * spec doesn't say what it is (on some GOPs it is smaller than the frame),
++	 * and the loader that started us already picked a sensible mode. */
++
++	// Largest integer scale that fits the current mode (capped so slow
++	// firmware blitters keep up), centred.
+ 	{
+-		printf("GOP mode not set; using native console mode\n");
++		UINT32 hres = gGOP->Mode->Info->HorizontalResolution;
++		UINT32 vres = gGOP->Mode->Info->VerticalResolution;
++		frameScale = hres / SCREENWIDTH < vres / SCREENHEIGHT ? hres / SCREENWIDTH : vres / SCREENHEIGHT;
++		if (frameScale > MAX_FRAME_SCALE) frameScale = MAX_FRAME_SCALE;
++		if (frameScale < 1) frameScale = 1;
++		frameWidth = SCREENWIDTH * frameScale;
++		frameHeight = SCREENHEIGHT * frameScale;
++		frameLeft = hres > frameWidth ? (hres - frameWidth) >> 1 : 0;
++		frameTop = vres > frameHeight ? (vres - frameHeight) >> 1 : 0;
++
++		// Black out whatever the shell or loader left around the frame.
++		EFI_GRAPHICS_OUTPUT_BLT_PIXEL black = { 0, 0, 0, 0 };
++		gGOP->Blt(gGOP, &black, EfiBltVideoFill, 0, 0, 0, 0, hres, vres, 0);
+ 	}
+-	
+-	// Calculate frame origin in current display mode
+-	frameWidth = SCREENWIDTH * FRAME_SCALE;
+-	frameHeight = SCREENHEIGHT * FRAME_SCALE;
+-	frameLeft = (gGOP->Mode->Info->HorizontalResolution - frameWidth) >> 1;
+-	frameTop = (gGOP->Mode->Info->VerticalResolution - frameHeight) >> 1;
+ 
+ 	// Pick frame render func
+ 	gRenderFunc = GopBltRender;
+@@ -317,12 +337,12 @@ void MakeFrame (void)
+ 		{
+ 			byte pixel = *srcLine++;
+ 
+-			for (linedest = 0; linedest < FRAME_SCALE; linedest++)
++			for (linedest = 0; linedest < frameScale; linedest++)
+ 			{
+ 			*dstLine++ = gPalette[pixel];
+ 			}
+ 		}
+-		for (linedest = 0; linedest < (FRAME_SCALE - 1); linedest++)
++		for (linedest = 0; linedest < (frameScale - 1); linedest++)
+ 		{
+ 			// Copy this dst line to the next one
+ 			memcpy(dstLine, curLine, frameWidth * sizeof(*frameBuffer));

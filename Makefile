@@ -10,6 +10,7 @@ VERSION  := $(shell tr -d '[:space:]' < VERSION)
 OVMF_CODE ?= /usr/share/edk2/x64/OVMF_CODE.4m.fd
 OVMF_VARS ?= /usr/share/edk2/x64/OVMF_VARS.4m.fd
 LIMINE    ?= /usr/share/limine/BOOTX64.EFI
+QEMU_MEM  ?= 1024
 
 CFLAGS := --target=x86_64-unknown-windows -ffreestanding -fshort-wchar -mno-red-zone \
           -fno-stack-protector -mno-stack-arg-probe -std=c11 -O2 -Wall -Wextra \
@@ -19,11 +20,11 @@ LDFLAGS := -subsystem:efi_application -entry:efi_main -nodefaultlib -machine:x64
 
 SRCS := src/main.c src/gfx.c src/scan.c src/lib.c
 OBJS := $(SRCS:src/%.c=$(BUILD)/%.o)
-TESTS := hello exitdata modeswitch
+TESTS := hello exitdata modeswitch lowhog
 
-.PHONY: all tests esp run run-sb clean font version
+.PHONY: all tests esp run run-sb clean font version doom
 
-all: $(BUILD)/partybox.efi
+all: $(BUILD)/partybox.efi $(BUILD)/blackjack.efi
 
 $(BUILD)/partybox.efi: $(OBJS)
 	$(LD) $(LDFLAGS) -out:$@ $^
@@ -35,14 +36,22 @@ $(BUILD)/%.o: src/%.c $(wildcard src/*.h) | $(BUILD)
 $(BUILD)/main.o: VERSION
 
 $(BUILD):
-	mkdir -p $(BUILD)/test
+	mkdir -p $(BUILD)/test $(BUILD)/apps
 
 version:
 	@echo $(VERSION)
 
 # Regenerate the embedded font (needs Pillow and Noto Sans / DejaVu Sans installed).
 font:
-	$(PYTHON) tools/genfont.py src/font_data.h
+	$(PYTHON) tools/genfont.py ui src/font_data.h
+	$(PYTHON) tools/genfont.py cards apps/blackjack/font_cards.h
+
+# ---- showcase apps (share partybox's gfx + lib) -------------------------------
+$(BUILD)/apps/blackjack.o: apps/blackjack/blackjack.c apps/blackjack/font_cards.h $(wildcard src/*.h) | $(BUILD)
+	$(CC) $(CFLAGS) -Iapps/blackjack -c $< -o $@
+
+$(BUILD)/blackjack.efi: $(BUILD)/apps/blackjack.o $(BUILD)/gfx.o $(BUILD)/lib.o
+	$(LD) $(LDFLAGS) -out:$@ $^
 
 # ---- test payloads ----------------------------------------------------------
 tests: $(TESTS:%=$(BUILD)/test/%.efi)
@@ -53,27 +62,40 @@ $(BUILD)/test/%.o: test/testapp.c src/lib.h | $(BUILD)
 $(BUILD)/test/%.efi: $(BUILD)/test/%.o $(BUILD)/lib.o
 	$(LD) $(LDFLAGS) -out:$@ $^
 
+# ---- DOOM: third-party apps/uefidoom submodule, built with edk2 + edk2-libc ---
+doom:
+	apps/uefidoom-build/build.sh
+
 # ---- QEMU playground: Limine -> partybox -> test apps --------------------------
 ESP := $(BUILD)/esp.img
+ESP_MB ?= 128
+# Extra folders copied as-is into PARTYBOX\<name>\ when present (git-ignored,
+# e.g. doom/ with doom.efi and its WADs). Override: make esp ESP_EXTRA="a b".
+ESP_EXTRA ?= $(wildcard doom)
 
 esp: $(ESP)
 
-$(ESP): $(BUILD)/partybox.efi tests examples/limine.conf
+$(ESP): $(BUILD)/partybox.efi $(BUILD)/blackjack.efi tests examples/limine.conf $(shell find $(ESP_EXTRA) -type f 2>/dev/null) $(wildcard $(BUILD)/doom.efi)
 	rm -f $@
-	mformat -C -F -i $@ -T 131072 -h 64 -s 32 ::
+	mformat -C -F -i $@ -T $$(( $(ESP_MB) * 2048 )) -h 64 -s 32 ::
 	mmd -i $@ ::/EFI ::/EFI/BOOT ::/EFI/partybox ::/EFI/partybox/PARTYBOX ::/EFI/partybox/PARTYBOX/tools
 	mcopy -i $@ $(LIMINE) ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i $@ examples/limine.conf ::/EFI/BOOT/limine.conf
 	mcopy -i $@ $(BUILD)/partybox.efi ::/EFI/partybox/partybox.efi
-	mcopy -i $@ $(BUILD)/test/hello.efi $(BUILD)/test/exitdata.efi $(BUILD)/test/modeswitch.efi \
+	mcopy -i $@ $(BUILD)/test/hello.efi $(BUILD)/test/exitdata.efi $(BUILD)/test/modeswitch.efi $(BUILD)/test/lowhog.efi \
 		::/EFI/partybox/PARTYBOX/
 	mcopy -i $@ $(BUILD)/test/hello.efi ::/EFI/partybox/PARTYBOX/tools/nested-hello.efi
+	mcopy -i $@ $(BUILD)/blackjack.efi ::/EFI/partybox/PARTYBOX/
+	$(foreach d,$(ESP_EXTRA),mcopy -s -i $@ $(d) ::/EFI/partybox/PARTYBOX/ &&) true
+	# A source-built doom.efi (make doom) replaces whatever doom/ shipped with.
+	if [ -f $(BUILD)/doom.efi ] && [ -d doom ]; then \
+		mcopy -o -i $@ $(BUILD)/doom.efi ::/EFI/partybox/PARTYBOX/doom/doom.efi; fi
 
 $(BUILD)/OVMF_VARS.fd: | $(BUILD)
 	cp $(OVMF_VARS) $@
 
 run: $(ESP) $(BUILD)/OVMF_VARS.fd
-	qemu-system-x86_64 -machine q35 -m 512 -net none \
+	qemu-system-x86_64 -machine q35 -m $(QEMU_MEM) -net none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(BUILD)/OVMF_VARS.fd \
 		-drive format=raw,file=$(ESP) $(QEMUFLAGS)

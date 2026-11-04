@@ -59,8 +59,8 @@ jobs:
       - name: Package
         run: |
           mkdir dist
-          cp build/partybox.efi dist/
-          (cd dist && sha256sum partybox.efi > SHA256SUMS)
+          cp build/partybox.efi build/blackjack.efi dist/
+          (cd dist && sha256sum *.efi > SHA256SUMS)
           cat dist/SHA256SUMS
 
       - uses: actions/upload-artifact@v7
@@ -97,6 +97,6 @@ jobs:
           fi
           flags=()
           [[ "$VERSION" == *-* ]] && flags+=(--prerelease)
-          gh release create "$tag" dist/partybox.efi dist/SHA256SUMS \
+          gh release create "$tag" dist/partybox.efi dist/blackjack.efi dist/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "partybox $tag" --generate-notes "${flags[@]}"
