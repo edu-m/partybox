@@ -60,12 +60,27 @@ Keys: `↑`/`↓` (or `j`/`k`), `PgUp`/`PgDn`, `Home`/`End`, `Enter` to launch,
 
 ## Options
 
-partybox reads its load options, so with Limine you pass them via `cmdline:`
-(from the UEFI shell, as arguments):
+Settings come from an optional `partybox.conf` in the same directory as
+`partybox.efi` (see [`examples/partybox.conf`](examples/partybox.conf)):
+
+| Key | |
+| --- | --- |
+| `selection=PATH` | app highlighted at start and autobooted, as its path inside `PARTYBOX` (e.g. `doom\PlayDoom.efi`; `.efi` optional) |
+| `countdown=N` | autoboot countdown in seconds, 0 to 65535; `countdown=0` disables autoboot (default 5) |
+
+One `key=value` per line. Keys are case-insensitive, blanks around keys and
+values don't matter, and the file may be ASCII/UTF-8 or UTF-16LE with a BOM.
+Every line that isn't a valid entry (comments, unknown keys, bad values) is
+ignored, and a later valid line overrides an earlier one. A `selection` that
+matches no app is reported in red under the menu, and the first app stays
+selected.
+
+partybox also reads its load options, so with Limine you can pass them via
+`cmdline:` (from the UEFI shell, as arguments). They override the file:
 
 | Option | |
 | --- | --- |
-| `timeout=N` | autoboot countdown in seconds; `timeout=0` disables autoboot (default 5) |
+| `timeout=N` | autoboot countdown in seconds; `timeout=0` disables autoboot |
 
 If the folder can't be found next to the image (some loaders don't report
 where an image came from), partybox looks for the same path on every volume,
@@ -227,7 +242,17 @@ through the firmware, with a key counting as held until its repeats stop.
   1993.
 
 `-pcspeaker` forces the speaker even with a driver present, `-nopcspeaker`
-turns it off, `-nosfx` turns both off. There is no music (that would need an
+turns it off, `-nosfx` turns both off, `-sndout N` picks another codec
+output (the startup text lists them: rear line-out, front headphones...).
+
+If a machine stays silent, the startup text says why: it lists the PCI audio
+devices (vendor:device and class; an Intel audio DSP shows up as class 04.01
+and needs the firmware's audio set to HD Audio/legacy mode), how many codecs
+AudioDxe bound, every output port and the path chosen. `-sndinfo` pauses on
+that text until a key is pressed, and the chosen path is also shown in the
+HUD message line when the first level starts (`Sound: HD Audio out 0 Line`
+or `Sound: PC speaker (no HD Audio codec)`). A PC speaker only sounds on
+boards that actually have a beeper fitted. There is no music (that would need an
 OPL emulator). To hear the HD Audio path in QEMU:
 `make run QEMUFLAGS="-audiodev pa,id=snd -device intel-hda -device hda-output,audiodev=snd"`
 (use `-audiodev wav,id=snd,path=out.wav` to record instead).

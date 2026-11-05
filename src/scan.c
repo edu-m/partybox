@@ -404,6 +404,19 @@ void scan_free(struct scan *s) {
     memset(s, 0, sizeof(*s));
 }
 
+bool scan_image_location(EFI_HANDLE *fs, CHAR16 **dir) {
+    EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
+    *fs = NULL;
+    *dir = NULL;
+    if (EFI_ERROR(gBS->HandleProtocol(gImageHandle, &gEfiLoadedImageProtocolGuid, (void **)&li)) || !li ||
+        !li->DeviceHandle)
+        return false;
+    *dir = image_dir(li);
+    if (!*dir) return false;
+    *fs = li->DeviceHandle;
+    return true;
+}
+
 void scan_run(struct scan *s) {
     scan_free(s);
 

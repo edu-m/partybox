@@ -26,3 +26,7 @@ void scan_free(struct scan *s);
 
 /* Full path to an app on s->fs_handle. Caller frees. */
 CHAR16 *scan_app_path(const struct scan *s, const struct app *a);
+
+/* The volume and directory partybox.efi was loaded from (dir like
+ * L"\\EFI\\partybox", L"" for the root). Caller frees *dir. */
+bool scan_image_location(EFI_HANDLE *fs, CHAR16 **dir);

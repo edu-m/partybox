@@ -1,0 +1,46 @@
+AMD/ATI HDA controllers: enable DMA snooping (misc control 2 bits 2:0 =
+010b) like Linux's ATI_SB450_HDAUDIO_ENABLE_SNOOP; without it the engine
+can read stale memory and play silence. Intel's No Snoop bit was already
+cleared.
+
+diff --git a/Platform/AudioDxe/HdaController/HdaController.c b/Platform/AudioDxe/HdaController/HdaController.c
+index 8c80bfe..d049f46 100644
+--- a/Platform/AudioDxe/HdaController/HdaController.c
++++ b/Platform/AudioDxe/HdaController/HdaController.c
+@@ -177,6 +177,21 @@ HdaControllerInitPciHw(
+             return Status;
+     }
+ 
++    // AMD/ATI controllers: make DMA snoop the CPU caches (misc control 2,
++    // bits 2:0 = 010b), as Linux does. Otherwise the engine can read stale
++    // memory behind the caches and play silence or garbage.
++    if (GET_PCI_VENDOR_ID(HdaControllerDev->VendorId) == VEN_AMD_ID
++        || GET_PCI_VENDOR_ID(HdaControllerDev->VendorId) == PCI_HDA_VEN_AMD2_ID) {
++        UINT8 HdaMisc;
++        Status = PciIo->Pci.Read(PciIo, EfiPciIoWidthUint8, PCI_HDA_AMD_MISC2_OFFSET, 1, &HdaMisc);
++        if (!EFI_ERROR (Status) && (HdaMisc & PCI_HDA_AMD_MISC2_SNOOP_MASK) != PCI_HDA_AMD_MISC2_SNOOP) {
++            HdaMisc = (HdaMisc & ~PCI_HDA_AMD_MISC2_SNOOP_MASK) | PCI_HDA_AMD_MISC2_SNOOP;
++            Status = PciIo->Pci.Write(PciIo, EfiPciIoWidthUint8, PCI_HDA_AMD_MISC2_OFFSET, 1, &HdaMisc);
++            if (EFI_ERROR (Status))
++                return Status;
++        }
++    }
++
+     // Get major/minor version.
+     Status = PciIo->Mem.Read(PciIo, EfiPciIoWidthUint8, PCI_HDA_BAR, HDA_REG_VMAJ, 1, &HdaControllerDev->MajorVersion);
+     if (EFI_ERROR(Status))
+diff --git a/Platform/AudioDxe/HdaController/HdaController.h b/Platform/AudioDxe/HdaController/HdaController.h
+index 16e62b0..e43c2ef 100644
+--- a/Platform/AudioDxe/HdaController/HdaController.h
++++ b/Platform/AudioDxe/HdaController/HdaController.h
+@@ -72,6 +72,10 @@ typedef struct {
+ #define PCI_HDA_TCSEL_TC0_MASK  ~(BIT0 | BIT1 | BIT2)
+ #define PCI_HDA_DEVC_OFFSET     0x78
+ #define PCI_HDA_DEVC_NOSNOOPEN  BIT11
++#define PCI_HDA_VEN_AMD2_ID         0x1022   // AMD proper (VEN_AMD_ID is ATI's 0x1002)
++#define PCI_HDA_AMD_MISC2_OFFSET    0x42     // ATI SB450+ / AMD misc control 2
++#define PCI_HDA_AMD_MISC2_SNOOP_MASK 0x07
++#define PCI_HDA_AMD_MISC2_SNOOP     0x02
+ 
+ //
+ // CORB and RIRB.

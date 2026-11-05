@@ -1,0 +1,177 @@
+Sound diagnostics, for machines that stay silent:
+ - startup lists PCI audio devices (vendor:device, class; flags a non-HDA
+   class such as an Intel audio DSP), how many codecs AudioDxe bound,
+   every output port, and the path finally chosen
+ - the chosen path is shown in the HUD message line when the first level
+   starts, so it can be read without catching the startup text
+ - -sndout N picks another output port (e.g. the front headphone jack)
+ - -sndinfo pauses after the audio setup text until a key is pressed
+
+diff --git a/uefidoom/d_main.c b/uefidoom/d_main.c
+index 02e0142..6bbf984 100644
+--- a/uefidoom/d_main.c
++++ b/uefidoom/d_main.c
+@@ -62,6 +62,7 @@ static const char rcsid[] = "$Id: d_main.c,v 1.8 1997/02/03 22:45:09 b1 Exp $";
+ 
+ #include "i_system.h"
+ #include "i_sound.h"
++#include "p_tick.h"
+ #include "i_video.h"
+ 
+ #include "g_game.h"
+@@ -338,6 +339,14 @@ static void D_FrameStats(void)
+ 	static int frames;
+ 	unsigned long long now;
+ 
++	// Say which sound path is in use when the first level starts, so a
++	// silent machine can be diagnosed without catching the startup text.
++	static boolean sndShown;
++	if (!sndShown && gamestate == GS_LEVEL && !demoplayback && leveltime >= 1 && leveltime < 2 * TICRATE)
++	{
++		sndShown = true;
++		players[consoleplayer].message = (char *)I_SoundDescription();
++	}
+ 	if (!showfps)
+ 		return;
+ 	frames++;
+diff --git a/uefidoom/doom.inf b/uefidoom/doom.inf
+index be042cc..b118d67 100644
+--- a/uefidoom/doom.inf
++++ b/uefidoom/doom.inf
+@@ -112,6 +112,8 @@ efi/chkstk.nasm | MSFT
+   gEfiSimplePointerProtocolGuid
+   gEfiSimpleTextInputExProtocolGuid
+   gEfiAudioIoProtocolGuid
++  gEfiHdaIoProtocolGuid
++  gEfiPciIoProtocolGuid
+   gEfiUsbIoProtocolGuid
+   gEfiSimpleTextInProtocolGuid
+   gEfiDevicePathProtocolGuid
+diff --git a/uefidoom/efi/i_sound.c b/uefidoom/efi/i_sound.c
+index 09bfcf1..8b3f681 100644
+--- a/uefidoom/efi/i_sound.c
++++ b/uefidoom/efi/i_sound.c
+@@ -42,6 +42,9 @@
+ #include <Include/Protocol/AudioIo.h>
+ #include <Library/UefiLib.h>
+ #include <Library/DevicePathLib.h>
++#include <Protocol/PciIo.h>
++#include <IndustryStandard/Pci.h>
++#include <Protocol/HdaIo.h>
+ 
+ EFI_AUDIO_IO_PROTOCOL *audioIo;
+ EFI_AUDIO_IO_PROTOCOL_PORT *outputPorts = NULL;
+@@ -49,6 +52,47 @@ UINTN outputCount = 0;
+ UINTN outputToUse = 0;
+ boolean outputFound = 0;
+ static boolean hdaActive = 0;
++static char sndDesc[64] = "Sound: off";   // shown in the HUD when the first level starts
++static const char *DeviceNames[EfiAudioIoDeviceMaximum] = { "Line", "Speaker", "Headphones", "SPDIF", "Mic", "HDMI", "Other" };
++
++const char *I_SoundDescription(void) { return sndDesc; }
++
++// What's on the PCI bus and what the driver made of it, so a silent machine
++// can be diagnosed from the startup text (or -sndinfo, which pauses on it).
++static void I_AudioDiagnostics(void)
++{
++    UINTN n = 0, i, found = 0;
++    EFI_HANDLE *h = NULL;
++    if (!EFI_ERROR(gBS->LocateHandleBuffer(ByProtocol, &gEfiPciIoProtocolGuid, NULL, &n, &h)))
++    {
++        for (i = 0; i < n; i++)
++        {
++            EFI_PCI_IO_PROTOCOL *pci;
++            UINT32 id = 0; UINT8 cls[3] = {0};
++            if (EFI_ERROR(gBS->HandleProtocol(h[i], &gEfiPciIoProtocolGuid, (VOID**)&pci)))
++                continue;
++            pci->Pci.Read(pci, EfiPciIoWidthUint32, PCI_VENDOR_ID_OFFSET, 1, &id);
++            pci->Pci.Read(pci, EfiPciIoWidthUint8, PCI_CLASSCODE_OFFSET, 3, cls);   // prog-if, subclass, class
++            if (cls[2] != PCI_CLASS_MEDIA)
++                continue;
++            found++;
++            printf("PCI audio device %04X:%04X class %02X.%02X%s\n", id & 0xffff, id >> 16, cls[2], cls[1],
++                   cls[1] == 0x03 ? " (HD Audio)" :
++                   cls[1] == 0x01 ? " (not HD Audio class: Intel audio DSP mode? set the firmware to HD Audio/legacy)" : "");
++        }
++        gBS->FreePool(h);
++    }
++    if (!found)
++        printf("No PCI audio device found.\n");
++    n = 0; h = NULL;
++    if (!EFI_ERROR(gBS->LocateHandleBuffer(ByProtocol, &gEfiHdaIoProtocolGuid, NULL, &n, &h)))
++    {
++        printf("AudioDxe: %u codec(s) found\n", (unsigned)n);
++        gBS->FreePool(h);
++    }
++    else
++        printf("AudioDxe: no HD Audio controller bound (driver not loaded, or it doesn't support this controller)\n");
++}
+ STATIC CHAR16 *DefaultDevices[EfiAudioIoDeviceMaximum] = { L"Line", L"Speaker", L"Headphones", L"SPDIF", L"Mic", L"HDMI", L"Other" };
+ STATIC CHAR16 *Locations[EfiAudioIoLocationMaximum] = { L"N/A", L"rear", L"front", L"left", L"right", L"top", L"bottom", L"other" };
+ STATIC CHAR16 *Surfaces[EfiAudioIoSurfaceMaximum] = { L"external", L"internal", L"other" };
+@@ -60,7 +104,10 @@ void I_InitSound()
+     // speaker port, else the first port it has.
+     UINTN HandlesCount = 0;
+     EFI_HANDLE *handles = NULL;
+-    EFI_STATUS status1 = gBS->LocateHandleBuffer(ByProtocol, &gEfiAudioIoProtocolGuid, NULL, &HandlesCount, &handles);
++    EFI_STATUS status1;
++    int p;
++    I_AudioDiagnostics();
++    status1 = gBS->LocateHandleBuffer(ByProtocol, &gEfiAudioIoProtocolGuid, NULL, &HandlesCount, &handles);
+     soundinit = true;
+     if (!EFI_ERROR(status1))
+     {
+@@ -102,6 +149,16 @@ void I_InitSound()
+                 outputFound = true;
+                 outputToUse = 0;
+             }
++            // -sndout N: use output N instead (e.g. the front headphone jack)
++            p = M_CheckParm("-sndout");
++            if (p && p < myargc - 1)
++            {
++                int want = atoi(myargv[p + 1]);
++                if (want >= 0 && want < (int)outputCount)
++                    outputToUse = want;
++                else
++                    printf("-sndout %d: no such output (0..%u)\n", want, (unsigned)outputCount - 1);
++            }
+             printf("Audio output %u selected.\n", (unsigned)outputToUse);
+         }
+         if (handles)
+@@ -116,8 +173,21 @@ void I_InitSound()
+     // driver at all. -pcspeaker forces it, -nopcspeaker disables it.
+     hdaActive = outputFound && !M_CheckParm("-pcspeaker") && !M_CheckParm("-nosfx")
+                 && I_HDA_Init(audioIo, outputToUse);
+-    if (!hdaActive && !M_CheckParm("-nopcspeaker") && !M_CheckParm("-nosfx"))
++    if (hdaActive)
++        sprintf(sndDesc, "Sound: HD Audio out %u %s", (unsigned)outputToUse,
++                outputPorts[outputToUse].Device < EfiAudioIoDeviceMaximum ? DeviceNames[outputPorts[outputToUse].Device] : "?");
++    else if (!M_CheckParm("-nopcspeaker") && !M_CheckParm("-nosfx"))
++    {
+         I_PCS_Init();
++        sprintf(sndDesc, "Sound: PC speaker (%s)",
++                outputFound ? "HD Audio init failed" : HandlesCount ? "no usable HD Audio output" : "no HD Audio codec");
++    }
++    printf("%s\n", sndDesc);
++    if (M_CheckParm("-sndinfo"))
++    {
++        printf("-sndinfo: press a key to continue.\n");
++        getchar();
++    }
+ }
+ 
+ void I_UpdateSound(void)
+diff --git a/uefidoom/i_sound.h b/uefidoom/i_sound.h
+index bbfabac..6f90999 100644
+--- a/uefidoom/i_sound.h
++++ b/uefidoom/i_sound.h
+@@ -40,6 +40,9 @@ extern char* sndserver_filename;
+ // Init at program start...
+ void I_InitSound();
+ 
++// One line describing the sound path in use (for the HUD / diagnostics).
++const char *I_SoundDescription(void);
++
+ // ... update sound buffer and audio device at runtime...
+ void I_UpdateSound(void);
+ void I_SubmitSound(void);

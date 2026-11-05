@@ -1,4 +1,6 @@
 /* partybox: a tiny chainloadable EFI launcher for whatever is in .\PARTYBOX */
+#include "ProcessorBind.h"
+#include "Uefi/UefiBaseType.h"
 #include "lib.h"
 #include "gfx.h"
 #include "scan.h"
@@ -6,7 +8,8 @@
 #ifndef PARTYBOX_VERSION        /* normally injected from VERSION by the Makefile */
 #define PARTYBOX_VERSION L"dev"
 #endif
-#define DEFAULT_TIMEOUT  5   /* seconds; override with "timeout=N" in the load options */
+#define DEFAULT_TIMEOUT  5   /* seconds; override with countdown=N in partybox.conf
+                                or "timeout=N" in the load options */
 
 EFI_HANDLE gImageHandle;
 EFI_SYSTEM_TABLE *gST;
@@ -54,6 +57,11 @@ struct ui {
     color_t msg_color;
     int countdown;         /* seconds left before autoboot, 0 = off */
     EFI_EVENT timer;
+};
+
+struct conf{
+    CHAR16 selection[255];
+    UINT16 countdown;
 };
 
 static bool selectable(const struct row *r) {
@@ -760,13 +768,141 @@ static bool handle_key(struct ui *u, EFI_INPUT_KEY k) {
     }
 }
 
+/* ---- partybox.conf --------------------------------------------------------
+ * Optional, read from the directory partybox.efi was loaded from:
+ *
+ *   selection=doom\PlayDoom.efi   app highlighted at start (and autobooted),
+ *                                 as a path inside PARTYBOX; ".efi" optional
+ *   countdown=10                  autoboot seconds, 0 = off
+ *
+ * One key=value per line, keys case-insensitive, blanks around keys and
+ * values ignored, ASCII/UTF-8 or UTF-16LE with a BOM. Every line that isn't
+ * a valid entry (comments, unknown keys, bad values) is ignored; a later
+ * valid line overrides an earlier one. */
+#define CONF_NAME L"partybox.conf"
+#define CONF_MAX  (64 * 1024)
+
+static bool conf_blank(CHAR16 ch) { return ch == ' ' || ch == '\t'; }
+
+static bool conf_key_is(const CHAR16 *k, size_t n, const CHAR16 *want) {
+    size_t i = 0;
+    for (; i < n && want[i]; i++)
+        if (wlower(k[i]) != want[i]) return false;
+    return i == n && !want[i];
+}
+
+static void conf_line(struct conf *c, const CHAR16 *l, size_t n) {
+    while (n && conf_blank(*l)) { l++; n--; }
+    while (n && conf_blank(l[n - 1])) n--;
+    size_t eq = 0;
+    while (eq < n && l[eq] != '=') eq++;
+    if (eq == n) return;
+
+    size_t kn = eq;
+    while (kn && conf_blank(l[kn - 1])) kn--;
+    const CHAR16 *v = l + eq + 1;
+    size_t vn = n - eq - 1;
+    while (vn && conf_blank(*v)) { v++; vn--; }
+    if (!kn || !vn) return;
+    for (size_t i = 0; i < vn; i++)
+        if (v[i] < 0x20 || v[i] == 0x7f || v[i] == 0xfffd) return; /* control or undecodable */
+
+    if (conf_key_is(l, kn, L"countdown")) {
+        uint32_t x = 0;
+        for (size_t i = 0; i < vn; i++) {
+            if (v[i] < '0' || v[i] > '9') return;
+            x = x * 10 + (uint32_t)(v[i] - '0');
+            if (x > 0xffff) return;
+        }
+        c->countdown = (UINT16)x;
+    } else if (conf_key_is(l, kn, L"selection")) {
+        while (vn && (*v == '\\' || *v == '/')) { v++; vn--; }   /* relative to PARTYBOX */
+        if (!vn || vn >= sizeof(c->selection) / sizeof(c->selection[0])) return;
+        for (size_t i = 0; i < vn; i++) c->selection[i] = v[i] == '/' ? '\\' : v[i];
+        c->selection[vn] = 0;
+    }
+}
+
+/* Decode the file into UTF-16, one line at a time. Bytes that aren't valid
+ * UTF-8 become U+FFFD, which makes their line invalid. */
+static void conf_parse(struct conf *c, const uint8_t *d, size_t n) {
+    static CHAR16 line[512];
+    size_t ln = 0;
+    bool utf16 = n >= 2 && d[0] == 0xff && d[1] == 0xfe;
+    size_t i = utf16 ? 2 : (n >= 3 && d[0] == 0xef && d[1] == 0xbb && d[2] == 0xbf) ? 3 : 0;
+    bool overflow = false;
+
+    while (i <= n) {
+        uint32_t ch;
+        if (i == n) ch = '\n';
+        else if (utf16) {
+            if (i + 1 >= n) break;
+            ch = (uint32_t)d[i] | (uint32_t)d[i + 1] << 8;
+            i += 2;
+        } else {
+            uint8_t b = d[i++];
+            int more = b < 0x80 ? 0 : (b & 0xe0) == 0xc0 ? 1 : (b & 0xf0) == 0xe0 ? 2 : -1;
+            ch = more == 0 ? b : more == 1 ? (b & 0x1fu) : (b & 0x0fu);
+            for (int k = 0; k < more; k++, i++) {
+                if (i >= n || (d[i] & 0xc0) != 0x80) { more = -1; break; }
+                ch = ch << 6 | (d[i] & 0x3fu);
+            }
+            if (more < 0 || (more == 1 && ch < 0x80) || (more == 2 && (ch < 0x800 || (ch >= 0xd800 && ch < 0xe000))))
+                ch = 0xfffd;
+        }
+        if (ch == '\n') {
+            if (!overflow) conf_line(c, line, ln && line[ln - 1] == '\r' ? ln - 1 : ln);
+            ln = 0;
+            overflow = false;
+            if (i >= n) break;
+            continue;
+        }
+        if (ln < sizeof(line) / sizeof(line[0])) line[ln++] = (CHAR16)ch;
+        else overflow = true;   /* too long to be a valid entry */
+    }
+}
+
+static void conf_load(struct conf *c) {
+    EFI_HANDLE fs;
+    CHAR16 *dir;
+    if (!scan_image_location(&fs, &dir)) return;
+    CHAR16 path[512];
+    wcopy(path, 512, dir);
+    wappend(path, 512, L"\\" CONF_NAME);
+    xfree(dir);
+
+    void *data = NULL;
+    UINTN size = 0;
+    if (!EFI_ERROR(read_file(fs, path, &data, &size)) && size <= CONF_MAX)
+        conf_parse(c, data, size);
+    xfree(data);
+}
+
+/* Highlight the app named by `selection`, matching its path inside PARTYBOX
+ * with or without the ".efi" extension. */
+static void select_conf(struct ui *u, const struct conf *c) {
+    if (!c->selection[0]) return;
+    CHAR16 with_ext[260];
+    wcopy(with_ext, 260, c->selection);
+    wappend(with_ext, 260, L".efi");
+    for (int i = 0; i < u->nrows; i++) {
+        if (u->rows[i].kind != ROW_APP) continue;
+        const CHAR16 *rel = u->scan.apps[u->rows[i].app].rel;
+        if (wicmp(rel, c->selection) == 0 || wicmp(rel, with_ext) == 0) {
+            u->sel = i;
+            return;
+        }
+    }
+    set_msg(u, C_ERR, CONF_NAME L": no app ", c->selection, NULL);
+}
+
 /* Look for "timeout=N" (seconds, 0 = off) in our load options, e.g. Limine's
  * `cmdline: timeout=10` or arguments from the UEFI shell. */
-static int parse_timeout(void) {
+static int parse_timeout(int dflt) {
     EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
     if (EFI_ERROR(gBS->HandleProtocol(gImageHandle, &gEfiLoadedImageProtocolGuid, (void **)&li)) || !li ||
         !li->LoadOptions || li->LoadOptionsSize < 2 * 8)
-        return DEFAULT_TIMEOUT;
+        return dflt;
     const CHAR16 *s = li->LoadOptions;
     size_t n = li->LoadOptionsSize / sizeof(CHAR16);
     static const CHAR16 key[] = L"timeout=";
@@ -781,7 +917,7 @@ static int parse_timeout(void) {
             v = v * 10 + (s[k] - '0');
         if (any) return v;
     }
-    return DEFAULT_TIMEOUT;
+    return dflt;
 }
 
 static void start_countdown(struct ui *u, int seconds) {
@@ -817,9 +953,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     gST->ConOut->EnableCursor(gST->ConOut, FALSE);
     if (!u.have_gfx) gST->ConOut->ClearScreen(gST->ConOut);
 
+    /* Settings: built-in defaults, then partybox.conf, then load options. */
+    static struct conf c;
+    memset(&c, 0, sizeof(c));
+    c.countdown = DEFAULT_TIMEOUT;
+    conf_load(&c);
+
     probe_firmware(&u);
     rescan(&u);
-    start_countdown(&u, parse_timeout());
+    select_conf(&u, &c);
+    start_countdown(&u, parse_timeout(c.countdown));
     draw(&u);
 
     for (;;) {
