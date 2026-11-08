@@ -131,7 +131,7 @@ release step is skipped: bump `VERSION` in the commit you want to release.
 ## Installing with Limine
 
 Copy `build/partybox.efi` to e.g. `/EFI/partybox/partybox.efi` on the ESP,
-create `/EFI/partybox/PARTYBOX/`, and add an entry to your `limine.conf`:
+create `/EFI/partybox/PARTYBOX/`, and, for example if using Limine as primary bootloader, add an entry to your `limine.conf`:
 
 ```
 /partybox
