@@ -7,6 +7,19 @@ application it finds (by content, not by name, so EFI-stub kernels like
 `vmlinuz-linux` count too), so you can drop test programs into a folder and pick one after a
 reboot without ever touching your main bootloader's config.
 
+> [!WARNING]
+> **This is a hobby project, made for fun.** It exists to run UEFI apps and
+> games, nothing more.
+>
+> - **It is not meant to be your primary bootloader.** Chainload it from a real
+>   one and keep a way to boot your system that doesn't depend on partybox.
+> - **No warranty, no responsibility.** Use it at your own risk. The author is
+>   not responsible for anything that happens to your machine, your data or
+>   your boot setup.
+> - **Memory safety is not guaranteed.** It is written in C and has bugs.
+> - **UEFI compliance should be up to spec, but that is not guaranteed
+>   either.**
+
 ```
 ESP
 └── EFI
@@ -308,3 +321,10 @@ as on real PCs (OVMF otherwise prefers low memory). Run it before an app that
 
 The embedded glyphs are rasterized from Noto Sans (SIL Open Font License 1.1),
 with a few symbols from DejaVu Sans.
+
+## License
+
+partybox itself is released under the [MIT License](LICENSE). Third-party parts
+keep their own licenses: the embedded glyphs are rasterized from Noto Sans and
+DejaVu Sans (SIL Open Font License 1.1), and the DOOM port in `apps/uefidoom`
+(a submodule, with the patches in `apps/uefidoom-build`) is GPL-2.0.
