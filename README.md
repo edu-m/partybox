@@ -330,3 +330,7 @@ partybox itself is released under the [MIT License](LICENSE). Third-party parts
 keep their own licenses: the embedded glyphs are rasterized from Noto Sans and
 DejaVu Sans (SIL Open Font License 1.1), and the DOOM port in `apps/uefidoom`
 (a submodule, with the patches in `apps/uefidoom-build`) is GPL-2.0.
+
+# AI disclaimer
+
+This project has been worked on partly by AI, this means that the project has been reworked somehow by an AI. For example writing tests, refactoring functions, writing some comments and cleaning up the codebase are some of the tasks that have been delegated. I take the time to validate each line of code and validate everything against the UEFI specification, but see this repository as a toy, not as a bonafide competitor to GRUB, Limine, etc.
