@@ -37,6 +37,8 @@ EFI_STATUS gfx_init(struct gfx *g) {
     if (!g->back || w != g->w || h != g->h) {
         xfree(g->back);
         g->back = xalloc((size_t)w * h * sizeof(color_t));
+        g->w = g->h = 0;
+        gfx_noclip(g);
         if (!g->back) return EFI_OUT_OF_RESOURCES;
         g->w = w;
         g->h = h;
@@ -51,7 +53,12 @@ EFI_STATUS gfx_init(struct gfx *g) {
     return EFI_SUCCESS;
 }
 
+static bool clip_to(int cx, int cy, int cw, int ch, int *x, int *y, int *w, int *h);
+
+/* The clip rectangle is always inside the back buffer: callers (the menu panel on a
+ * very short screen) may ask for more, and everything drawn is checked against it only. */
 void gfx_clip(struct gfx *g, int x, int y, int w, int h) {
+    if (!clip_to(0, 0, (int)g->w, (int)g->h, &x, &y, &w, &h)) { x = y = w = h = 0; }
     g->cx = x; g->cy = y; g->cw = w; g->ch = h;
 }
 
@@ -60,10 +67,10 @@ void gfx_noclip(struct gfx *g) {
 }
 
 /* A child app may have switched modes; put ours back. */
-void gfx_reclaim(struct gfx *g) {
-    if (!g->gop) return;
+EFI_STATUS gfx_reclaim(struct gfx *g) {
+    if (!g->gop) return EFI_UNSUPPORTED;
     if (g->gop->Mode->Mode != g->mode0) g->gop->SetMode(g->gop, g->mode0);
-    gfx_init(g);
+    return gfx_init(g);
 }
 
 static bool clip_to(int cx, int cy, int cw, int ch, int *x, int *y, int *w, int *h) {

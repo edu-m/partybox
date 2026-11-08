@@ -34,7 +34,7 @@ struct gfx {
 };
 
 EFI_STATUS gfx_init(struct gfx *g);   /* (re)query mode, (re)alloc back buffer */
-void gfx_reclaim(struct gfx *g);      /* after a child app ran: restore our mode */
+EFI_STATUS gfx_reclaim(struct gfx *g); /* after a child app ran: restore our mode; error if the back buffer is gone */
 void gfx_present(struct gfx *g, int x, int y, int w, int h);
 void gfx_present_all(struct gfx *g);
 

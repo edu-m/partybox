@@ -8,6 +8,7 @@
 #ifndef PARTYBOX_VERSION        /* normally injected from VERSION by the Makefile */
 #define PARTYBOX_VERSION L"dev"
 #endif
+#define MAX_IMAGE_BYTES (1ULL << 31)   /* sanity cap on a file we read whole into memory */
 #define DEFAULT_TIMEOUT  5   /* seconds; override with countdown=N in partybox.conf
                                 or "timeout=N" in the load options */
 
@@ -51,6 +52,7 @@ struct ui {
     int nrows;
     int sel;               /* index into rows */
     int scroll;            /* pixels */
+    bool rows_static;      /* rows points at the built-in fallback (allocation failed) */
     bool fwui_supported;
     bool secure_boot;
     CHAR16 msg[256];
@@ -69,11 +71,18 @@ static bool selectable(const struct row *r) {
 }
 
 static void build_rows(struct ui *u) {
-    xfree(u->rows);
+    static struct row fallback[2] = { { ROW_LABEL, 0, L"SYSTEM" }, { ROW_EXIT, 0, L"Exit" } };
+    if (!u->rows_static) xfree(u->rows);
     int max = u->scan.count + 10;
     u->rows = xalloc(sizeof(struct row) * (size_t)max);
+    u->rows_static = false;
     int n = 0;
-    if (!u->rows) { u->nrows = 0; return; }
+    if (!u->rows) { /* out of memory: no app list, but Exit still works */
+        u->rows = fallback;
+        u->rows_static = true;
+        u->nrows = 2;
+        return;
+    }
 
     u->rows[n++] = (struct row){ ROW_LABEL, 0, L"APPLICATIONS" };
     if (!u->scan.found) {
@@ -517,7 +526,7 @@ static EFI_DEVICE_PATH_PROTOCOL *file_device_path(EFI_HANDLE fs, const CHAR16 *p
     return (EFI_DEVICE_PATH_PROTOCOL *)buf;
 }
 
-static EFI_STATUS read_file(EFI_HANDLE fs, const CHAR16 *path, void **data, UINTN *size) {
+static EFI_STATUS read_file(EFI_HANDLE fs, const CHAR16 *path, void **data, UINTN *size, UINT64 max_size) {
     EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *sfs = NULL;
     EFI_FILE_PROTOCOL *root = NULL, *f = NULL;
     EFI_STATUS st = gBS->HandleProtocol(fs, &gEfiSimpleFileSystemProtocolGuid, (void **)&sfs);
@@ -530,6 +539,7 @@ static EFI_STATUS read_file(EFI_HANDLE fs, const CHAR16 *path, void **data, UINT
     UINTN isize = SIZE_OF_EFI_FILE_INFO + 512;
     EFI_FILE_INFO *info = xalloc(isize);
     st = info ? f->GetInfo(f, &gEfiFileInfoGuid, &isize, info) : EFI_OUT_OF_RESOURCES;
+    if (!EFI_ERROR(st) && info->FileSize > max_size) st = EFI_BAD_BUFFER_SIZE;
     if (!EFI_ERROR(st)) {
         *size = (UINTN)info->FileSize;
         *data = xalloc(*size);
@@ -566,7 +576,7 @@ static void prepare_console(void) {
 static void restore_screen(struct ui *u) {
     gST->ConIn->Reset(gST->ConIn, FALSE); /* drop keys the app left behind */
     gST->ConOut->EnableCursor(gST->ConOut, FALSE);
-    if (u->have_gfx) gfx_reclaim(&u->g); /* the app may have changed modes */
+    if (u->have_gfx && EFI_ERROR(gfx_reclaim(&u->g))) u->have_gfx = false; /* the app may have changed modes */
 }
 
 static void launch(struct ui *u, const struct app *a) {
@@ -577,7 +587,7 @@ static void launch(struct ui *u, const struct app *a) {
     EFI_HANDLE child = NULL;
     CHAR16 err[64] = { 0 };
 
-    EFI_STATUS st = path ? read_file(u->scan.fs_handle, path, &img, &size) : EFI_OUT_OF_RESOURCES;
+    EFI_STATUS st = path ? read_file(u->scan.fs_handle, path, &img, &size, (UINT64)MAX_IMAGE_BYTES) : EFI_OUT_OF_RESOURCES;
     if (EFI_ERROR(st)) {
         append_status(err, 64, st);
         set_msg(u, C_ERR, L"Couldn't read ", name, L": ");
@@ -588,6 +598,11 @@ static void launch(struct ui *u, const struct app *a) {
     /* Loading from a buffer with a real device path: the child gets a proper
      * DeviceHandle/FilePath, so it can find its own files (and nested partyboxes work). */
     EFI_DEVICE_PATH_PROTOCOL *dp = file_device_path(u->scan.fs_handle, path);
+    if (!dp) {
+        xfree(img);
+        set_msg(u, C_ERR, L"Couldn't load ", name, L": Out of Resources");
+        goto out;
+    }
     st = gBS->LoadImage(FALSE, gImageHandle, dp, img, size, &child);
     xfree(dp);
     xfree(img);
@@ -612,9 +627,16 @@ static void launch(struct ui *u, const struct app *a) {
     append_status(err, 64, st);
     set_msg(u, EFI_ERROR(st) ? C_ERR : C_OK, name, L" exited: ", err);
     if (exit_data) {
-        if (exit_size >= sizeof(CHAR16) && exit_data[0]) {
-            wappend(u->msg, 256, L"  \x00B7  ");
-            wappend(u->msg, 256, exit_data);
+        /* Per the spec ExitData is a NUL-terminated description only when the status is an
+         * error (and may be followed by binary data); with EFI_SUCCESS it is arbitrary.
+         * Never read past exit_size, whatever the image put there. */
+        if (EFI_ERROR(st)) {
+            size_t max = exit_size / sizeof(CHAR16), n = 0;
+            while (n < max && exit_data[n]) n++;
+            if (n && n < max) {
+                wappend(u->msg, 256, L"  \x00B7  ");
+                wappend(u->msg, 256, exit_data);
+            }
         }
         gBS->FreePool(exit_data);
     }
@@ -836,7 +858,7 @@ static void conf_parse(struct conf *c, const uint8_t *d, size_t n) {
         uint32_t ch;
         if (i == n) ch = '\n';
         else if (utf16) {
-            if (i + 1 >= n) break;
+            if (i + 1 >= n) { i = n; continue; } /* stray last byte: end the line */
             ch = (uint32_t)d[i] | (uint32_t)d[i + 1] << 8;
             i += 2;
         } else {
@@ -873,7 +895,7 @@ static void conf_load(struct conf *c) {
 
     void *data = NULL;
     UINTN size = 0;
-    if (!EFI_ERROR(read_file(fs, path, &data, &size)) && size <= CONF_MAX)
+    if (!EFI_ERROR(read_file(fs, path, &data, &size, CONF_MAX)))
         conf_parse(c, data, size);
     xfree(data);
 }
@@ -925,6 +947,7 @@ static void start_countdown(struct ui *u, int seconds) {
     if (EFI_ERROR(gBS->CreateEvent(EVT_TIMER, 0, NULL, NULL, &u->timer))) return;
     if (EFI_ERROR(gBS->SetTimer(u->timer, TimerPeriodic, 10000000 /* 1 s in 100 ns units */))) {
         gBS->CloseEvent(u->timer);
+        u->timer = NULL;
         return;
     }
     u->countdown = seconds;
@@ -969,7 +992,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
         UINTN idx = 0;
         EFI_INPUT_KEY k;
         EFI_EVENT events[2] = { gST->ConIn->WaitForKey, u.timer };
-        gBS->WaitForEvent(u.countdown ? 2 : 1, events, &idx);
+        if (EFI_ERROR(gBS->WaitForEvent(u.countdown ? 2 : 1, events, &idx))) {
+            /* Can't block on input (broken console?): poll gently instead of redrawing flat out. */
+            idx = 0;
+            gBS->Stall(20000);
+            if (EFI_ERROR(gST->ConIn->ReadKeyStroke(gST->ConIn, &k))) continue;
+            stop_countdown(&u);
+            bool run1 = handle_key(&u, k);
+            if (!run1) break;
+            draw(&u);
+            continue;
+        }
         if (u.countdown && idx == 1) {
             bool run = true;
             if (--u.countdown == 0) {
@@ -991,7 +1024,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     prepare_console();
     gST->ConOut->EnableCursor(gST->ConOut, TRUE);
     scan_free(&u.scan);
-    xfree(u.rows);
+    if (!u.rows_static) xfree(u.rows);
     xfree(u.g.back);
     return EFI_SUCCESS;
 }

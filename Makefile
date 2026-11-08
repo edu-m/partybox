@@ -22,7 +22,7 @@ SRCS := src/main.c src/gfx.c src/scan.c src/lib.c
 OBJS := $(SRCS:src/%.c=$(BUILD)/%.o)
 TESTS := hello exitdata modeswitch lowhog
 
-.PHONY: all tests esp run run-sb clean font version doom
+.PHONY: all tests esp run run-sb clean font version doom check fuzz
 
 all: $(BUILD)/partybox.efi $(BUILD)/blackjack.efi
 
@@ -61,6 +61,30 @@ $(BUILD)/test/%.o: test/testapp.c src/lib.h | $(BUILD)
 
 $(BUILD)/test/%.efi: $(BUILD)/test/%.o $(BUILD)/lib.o
 	$(LD) $(LDFLAGS) -out:$@ $^
+
+# ---- host-side tests ------------------------------------------------------------
+# The real efi_main() runs on the host under ASan/UBSan against a fake firmware
+# (test/host/fakefw.c): leaks, memory errors, spec violations, out-of-memory paths.
+# `make fuzz` runs libFuzzer on the PE, config and device-path parsers.
+HOST    := $(BUILD)/host
+HFLAGS  := -g -O1 -fshort-wchar -I$(EDK2)/MdePkg/Include -I$(EDK2)/MdePkg/Include/X64 -Isrc \
+           -Wno-macro-redefined -fsanitize=address,undefined -fno-sanitize=function \
+           -fno-sanitize-recover=undefined -fno-omit-frame-pointer
+HREN    := -Dmemset=pb_memset -Dmemcpy=pb_memcpy -Dmemmove=pb_memmove -Dmemcmp=pb_memcmp
+FUZZ_SECS ?= 60
+
+$(HOST)/fakefw: test/host/fakefw.c $(SRCS) $(wildcard src/*.h) VERSION
+	mkdir -p $(HOST)
+	for f in $(SRCS); do $(CC) $(HFLAGS) $(HREN) -DPARTYBOX_VERSION='L"host"' -c $$f \
+		-o $(HOST)/$$(basename $$f .c).o || exit 1; done
+	$(CC) $(HFLAGS) -c test/host/fakefw.c -o $(HOST)/fakefw.o
+	$(CC) $(HFLAGS) $(HOST)/main.o $(HOST)/scan.o $(HOST)/gfx.o $(HOST)/lib.o $(HOST)/fakefw.o -o $@
+
+check: all tests $(HOST)/fakefw
+	test/host/run.sh $(HOST)
+
+fuzz: all tests
+	EDK2=$(EDK2) test/host/fuzz.sh $(FUZZ_SECS)
 
 # ---- DOOM: third-party apps/uefidoom submodule, built with edk2 + edk2-libc ---
 doom:
