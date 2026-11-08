@@ -13,9 +13,11 @@ reboot without ever touching your main bootloader's config.
 >
 > - **It is not meant to be your primary bootloader.** Chainload it from a real
 >   one and keep a way to boot your system that doesn't depend on partybox.
-> - **No warranty, no responsibility.** Use it at your own risk. The author is
+> - **Use it at your own risk.** I'm
 >   not responsible for anything that happens to your machine, your data or
 >   your boot setup.
+>   **While you *can* use it as your primary bootloader**, it's not designed
+>   to be used that way.
 > - **Memory safety is not guaranteed.** It is written in C and has bugs.
 > - **UEFI compliance should be up to spec, but that is not guaranteed
 >   either.**
