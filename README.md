@@ -333,4 +333,4 @@ DejaVu Sans (SIL Open Font License 1.1), and the DOOM port in `apps/uefidoom`
 
 # AI disclaimer
 
-This project has been worked on partly by AI, this means that the project has been reworked somehow by an AI. For example writing tests, refactoring functions, writing some comments and cleaning up the codebase are some of the tasks that have been delegated. I take the time to validate each line of code and validate everything against the UEFI specification, but see this repository as a toy, not as a bonafide competitor to GRUB, Limine, etc.
+This project has been worked on partly by AI, this means that an AI has been involved on some tasks on this codebase. Writing tests, refactoring functions, writing some comments and cleaning up the codebase are some of the tasks that have been delegated. I take the time to validate each line of code and crucially verify everything against the UEFI specification, but see this repository as a toy, not as a bonafide competitor to GRUB, Limine, etc.
